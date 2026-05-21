@@ -10,6 +10,7 @@ import { Plus, FlaskConical, Trash2, Search, X, CheckCircle, Loader2 } from 'luc
 import { apiFetch } from '@/lib/auth';
 import { useAudit } from '@/hooks/useAudit';
 import { useLocale } from '@/i18n/useLocale';
+import { PageHeader } from '@/components/layout/PageHeader';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
