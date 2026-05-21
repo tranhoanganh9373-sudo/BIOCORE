@@ -245,6 +245,8 @@ import { listChannels as listNotifChannels, listRules as listNotifRules } from '
 import { registerHealthRoutes } from './health-routes';
 // SP-FX-43: Analytics Dashboard
 import { registerAnalyticsRoutes } from './analytics-routes';
+// SP-PLC-2: 受控 PLC 写入 + audit
+import { registerPlcWriteRoute } from './plc-write-routes';
 
 // JWT 认证
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
@@ -970,6 +972,38 @@ apiRouter.post('/plc/variables/:id/test', async (req, res) => {
     const eng = v.scaling_enabled ? scale(raw, v) : raw;
     res.json({ success: true, value: Math.round(eng * 100) / 100, raw, message: `${v.tag_name} = ${eng}` });
   } catch (e) { res.json({ success: false, message: (e as Error).message }); }
+});
+
+// SP-PLC-2: 受控 PLC 写入 — 需登录,confirmed:true gate,落 audit_logs
+registerPlcWriteRoute(apiRouter, {
+  getVariables: () => varManager.getVariables() as any,
+  getConnections: () => varManager.getConnections() as any,
+  writeAuditLog: (entry) => sqlite.writeAuditLog({
+    user_id: entry.user_id,
+    action: entry.action,
+    target_type: entry.target_type,
+    target_id: entry.target_id,
+    new_value: entry.new_value,
+    ip_address: entry.ip_address,
+  }),
+  performWrite: async (prep) => {
+    const client = new (S7Client as any)();
+    client.SetConnectionType(3);
+    await new Promise<void>((resolve, reject) => {
+      client.ConnectTo(prep.connection.ip, (prep.connection as any).rack ?? 0, (prep.connection as any).slot ?? 1, (err: any) => {
+        if (err) reject(new Error(`S7连接失败: errCode=${err}`)); else resolve();
+      });
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.WriteArea(AREA_DB, prep.db, prep.parsed.byte, prep.buf.length, WORDLEN_BYTE, prep.buf, (err: any) => {
+          if (err) reject(new Error(`S7写入 DB${prep.db}.${prep.parsed.byte} 失败: errCode=${err}`)); else resolve();
+        });
+      });
+    } finally {
+      client.Disconnect();
+    }
+  },
 });
 
 // ── 导入导出 ──

@@ -30,10 +30,12 @@
 // will need to whitelist this exception or move it behind a sub-entry.
 import { parseAddr, byteLen, decode, scale, validateAddr } from '../../plc-driver/src/utils';
 import { VariableMappingManager } from '../../plc-driver/src/variable-mapping';
+import { prepareWrite } from '../../plc-driver/src/write-helpers';
+import type { WritePrep, WriteSuccess } from '../../plc-driver/src/write-helpers';
 import type { PLCConnectionConfig, PLCVariableMapping } from '../../plc-driver/src/types';
 
-export { parseAddr, byteLen, decode, scale, validateAddr, VariableMappingManager };
-export type { PLCConnectionConfig, PLCVariableMapping };
+export { parseAddr, byteLen, decode, scale, validateAddr, VariableMappingManager, prepareWrite };
+export type { PLCConnectionConfig, PLCVariableMapping, WritePrep, WriteSuccess };
 
 // MOCK_PLC: 默认 false (生产安全), 开发演示需在 .env 设置 MOCK_PLC=true
 // 开启后所有 plcRead 调用返回模拟值, 启动时打印多行警告框
