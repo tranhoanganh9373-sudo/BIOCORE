@@ -155,6 +155,7 @@ export default function PhaseInstancesPage(): JSX.Element {
         <PhaseInstanceDialog
           classes={classes}
           reactors={reactors}
+          existingIds={instances.map(i => i.instance_id)}
           onSave={async (form) => {
             try { await create(form); setCreating(false); setOpError(null); }
             catch (e) { setOpError(e instanceof Error ? e.message : String(e)); }
