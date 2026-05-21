@@ -7,8 +7,9 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { Activity, History, Search, Play } from 'lucide-react';
+import { Activity, History, Search, Play, FlaskConical } from 'lucide-react';
 import { useLocale } from '@/i18n/useLocale';
+import { PageHeader } from '@/components/layout/PageHeader';
 
 // 懒加载 BatchComparePanel: 它静态 import echarts,eager 加载会拖首屏.
 const BatchComparePanel = dynamic(
@@ -133,9 +134,15 @@ export default function BatchesPage() {
   if (error) return <div className="p-8 text-center text-destructive">{error}</div>;
 
   return (
-    <div className="p-4 space-y-4">
+    <div className="p-6 max-w-6xl mx-auto space-y-6">
+      <PageHeader
+        icon={FlaskConical}
+        title="配方运行"
+        subtitle="正在运行的批次实时状态、历史回顾、批次对比分析"
+      />
+
       {/* 标签页切换 */}
-      <div className="flex gap-1 border-b border-border mb-4">
+      <div className="flex gap-1 border-b border-border">
         <button
           className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors flex items-center gap-2 ${tab === 'running' ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
           onClick={() => setTab('running')}

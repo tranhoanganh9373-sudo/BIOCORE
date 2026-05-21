@@ -9,6 +9,7 @@ import { ShieldCheck, FileText, X, Check, Loader2, Ban } from 'lucide-react';
 import { apiFetch } from '@/lib/auth';
 import { useAudit } from '@/hooks/useAudit';
 import { useLocale } from '@/i18n/useLocale';
+import { PageHeader } from '@/components/layout/PageHeader';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
@@ -152,36 +153,33 @@ export default function ReviewQueuePage() {
   const deprecationCount = pending.filter(r => r.status === 'pending_deprecation').length;
 
   return (
-    <div className="p-6 max-w-5xl mx-auto space-y-4">
+    <div className="p-6 max-w-6xl mx-auto space-y-6">
       {audit.dialog}
 
-      <div className="flex items-start justify-between">
-        <div>
-          <h1 className="text-2xl font-bold flex items-center gap-2">
-            <ShieldCheck className="w-6 h-6" /> 配方审核队列
-          </h1>
-          <p className="text-muted-foreground text-sm mt-1">
-            审核配方批准和废弃请求, 批准后生效, 拒绝将回到原状态并记录原因
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          {approvalCount > 0 && (
-            <div className="px-3 py-1.5 rounded bg-amber-500/10 text-sm text-amber-400">
-              待批准 <span className="font-bold">{approvalCount}</span>
-            </div>
-          )}
-          {deprecationCount > 0 && (
-            <div className="px-3 py-1.5 rounded bg-red-500/10 text-sm text-red-600">
-              待废弃 <span className="font-bold">{deprecationCount}</span>
-            </div>
-          )}
-          {pending.length === 0 && !loading && (
-            <div className="px-3 py-1.5 rounded bg-muted text-sm">
-              待审 <span className="font-bold text-primary">0</span>
-            </div>
-          )}
-        </div>
-      </div>
+      <PageHeader
+        icon={ShieldCheck}
+        title="配方审核队列"
+        subtitle="审核配方批准和废弃请求, 批准后生效, 拒绝将回到原状态并记录原因"
+        right={
+          <>
+            {approvalCount > 0 && (
+              <div className="px-3 py-1.5 rounded bg-amber-500/10 text-sm text-amber-500">
+                待批准 <span className="font-bold">{approvalCount}</span>
+              </div>
+            )}
+            {deprecationCount > 0 && (
+              <div className="px-3 py-1.5 rounded bg-red-500/10 text-sm text-red-600">
+                待废弃 <span className="font-bold">{deprecationCount}</span>
+              </div>
+            )}
+            {pending.length === 0 && !loading && (
+              <div className="px-3 py-1.5 rounded bg-muted text-sm">
+                待审 <span className="font-bold text-primary">0</span>
+              </div>
+            )}
+          </>
+        }
+      />
 
       {loading ? (
         <Card><CardContent className="p-8 text-center text-muted-foreground"><Loader2 className="w-4 h-4 animate-spin mx-auto mb-2" />加载中...</CardContent></Card>

@@ -2,6 +2,8 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
+import { Link2 } from 'lucide-react';
+import { PageHeader } from '@/components/layout/PageHeader';
 import { usePhaseInstances, type PhaseInstance } from '@/hooks/usePhaseInstances';
 
 interface ParamSchemaEntry {
@@ -74,8 +76,12 @@ export default function PhaseInstancesPage(): JSX.Element {
   }
 
   return (
-    <div className="p-6 max-w-6xl mx-auto">
-      <h1 className="text-2xl font-semibold mb-4">Phase Instances <span className="text-sm text-zinc-400 font-normal">— phase class 绑定到反应器的中间层</span></h1>
+    <div className="p-6 max-w-6xl mx-auto space-y-6">
+      <PageHeader
+        icon={Link2}
+        title="Phase Instances"
+        subtitle="phase class 绑定到反应器的中间层 — 一个 phase class + 一个 reactor + 参数 override = 一个 instance"
+      />
 
       <div className="flex gap-2 items-end mb-4">
         <div>
