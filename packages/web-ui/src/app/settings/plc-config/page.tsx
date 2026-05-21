@@ -145,15 +145,14 @@ export default function PLCConfigPage() {
     } catch { /* apiError 已设置 */ }
   }, []);
 
+  // SP-PLC-2: 永远拉全部 variables, PLC 切换走 client-side filter
+  // (变量映射 tab 的 PLC pill 需要每个 PLC 的 tag count, 必须在 client 全量持有)
   const loadVariables = useCallback(async () => {
     try {
-      const url = selectedConnection
-        ? `${API_BASE}/api/plc/variables?connection_id=${selectedConnection}`
-        : `${API_BASE}/api/plc/variables`;
-      const resp = await apiFetch(url);
+      const resp = await apiFetch(`${API_BASE}/api/plc/variables`);
       setVariables(await resp.json());
     } catch { /* apiError 已设置 */ }
-  }, [selectedConnection]);
+  }, []);
 
   useEffect(() => { loadConnections(); }, [loadConnections]);
   useEffect(() => { loadVariables(); }, [loadVariables]);
@@ -467,7 +466,8 @@ export default function PLCConfigPage() {
       v.description.includes(searchTerm) ||
       v.plc_address.toLowerCase().includes(searchTerm.toLowerCase());
     const matchGroup = filterGroup === 'all' || v.group === filterGroup;
-    return matchSearch && matchGroup;
+    const matchConn = selectedConnection === null || v.connection_id === selectedConnection;
+    return matchSearch && matchGroup && matchConn;
   });
 
   const groups = [...new Set(variables.map(v => v.group))];
@@ -647,6 +647,33 @@ export default function PLCConfigPage() {
 
         {/* ── Tab 2: 变量映射表 ── */}
         <TabsContent value="variables" className="space-y-4">
+          {/* PLC 分页 — 每个 PLC 一个 sub-tab,"全部" 显示所有 */}
+          {connections.length > 0 && (
+            <div className="flex flex-wrap gap-1 border-b pb-2">
+              <Button
+                variant={selectedConnection === null ? 'default' : 'ghost'}
+                size="sm"
+                onClick={() => setSelectedConnection(null)}
+              >
+                全部 ({variables.length})
+              </Button>
+              {connections.map(c => {
+                const count = variables.filter(v => v.connection_id === c.id).length;
+                return (
+                  <Button
+                    key={c.id}
+                    variant={selectedConnection === c.id ? 'default' : 'ghost'}
+                    size="sm"
+                    onClick={() => setSelectedConnection(c.id)}
+                    className="font-mono"
+                  >
+                    {c.name}{(c as any).reactor_id ? ` · ${(c as any).reactor_id}` : ''} ({count})
+                  </Button>
+                );
+              })}
+            </div>
+          )}
+
           {/* 工具栏 */}
           <div className="flex flex-wrap gap-3 items-center justify-between">
             <div className="flex gap-2 items-center">
@@ -662,19 +689,6 @@ export default function PLCConfigPage() {
                   {groups.map(g => <SelectItem key={g} value={g}>{g}</SelectItem>)}
                 </SelectContent>
               </Select>
-              {connections.length > 0 && (
-                <Select value={selectedConnection || 'all'} onValueChange={v => setSelectedConnection(v === 'all' ? null : v)}>
-                  <SelectTrigger className="w-[200px]"><SelectValue placeholder="PLC连接" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">全部连接</SelectItem>
-                    {connections.map(c => (
-                      <SelectItem key={c.id} value={c.id}>
-                        {c.name} ({c.ip}){(c as any).reactor_id ? ` — Unit: ${(c as any).reactor_id}` : ''}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
             </div>
             <div className="flex gap-2">
               <Button variant="outline" size="sm" onClick={loadDefaultTemplate}>
