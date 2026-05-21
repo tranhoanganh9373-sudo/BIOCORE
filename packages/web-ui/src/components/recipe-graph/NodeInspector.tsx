@@ -162,71 +162,49 @@ export function NodeInspector({ node, template, allTemplates, phaseInstances, al
               />
             </div>
 
+            {/* Phase Instance 选择 (主入口) — 选定后自动推断 phase_type / params / label */}
             <div>
-              <Label className="text-sm">类型 *</Label>
-              {allTemplates && allTemplates.length > 0 ? (
-                <select
-                  value={data.phase_type || ''}
-                  onChange={e => changePhaseType(e.target.value)}
-                  className="h-7 w-full text-sm font-mono mt-1 rounded bg-background border border-border px-1"
-                >
-                  <option value="">-- 选择 Phase 类型 --</option>
-                  {allTemplates.map(t => (
-                    <option key={t.type} value={t.type}>
-                      {phaseLabel(t.type, t.label)} ({t.fixed_steps} steps)
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <Input
-                  value={data.phase_type || ''}
-                  onChange={e => updateData({ phase_type: e.target.value })}
-                  placeholder="heating / fermentation / ..."
-                  className="h-7 text-sm font-mono mt-1"
-                />
+              <Label className="text-sm">Phase Instance *</Label>
+              <select
+                value={data.instance_id || ''}
+                onChange={e => {
+                  const instId = e.target.value;
+                  if (!instId) {
+                    updateData({ instance_id: undefined });
+                    return;
+                  }
+                  const inst = (phaseInstances || []).find(i => i.instance_id === instId);
+                  if (!inst) { updateData({ instance_id: instId }); return; }
+                  // 选 instance → 同步推断 phase_type (给参数 schema / 步骤预览用)
+                  const tmpl = allTemplates?.find(t => t.type === inst.phase_class);
+                  const params = { ...(tmpl?.default_params || {}), ...inst.params_override };
+                  updateData({
+                    instance_id: instId,
+                    phase_type: inst.phase_class,
+                    label: inst.label || tmpl?.label || instId,
+                    params,
+                  });
+                }}
+                className="h-7 w-full text-sm font-mono mt-1 rounded bg-background border border-border px-1"
+              >
+                <option value="">-- 选择 Phase Instance --</option>
+                {(phaseInstances || []).map(inst => (
+                  <option key={inst.instance_id} value={inst.instance_id}>
+                    {inst.instance_id} {inst.label ? `— ${inst.label}` : ''} · {inst.phase_class} @ {inst.reactor_id}
+                  </option>
+                ))}
+              </select>
+              {(phaseInstances || []).length === 0 && (
+                <div className="text-xs text-muted-foreground mt-1">
+                  暂无 Phase Instance — 去 <a href="/phase-instances" target="_blank" className="text-blue-500 underline">/phase-instances</a> 创建
+                </div>
+              )}
+              {data.instance_id && data.phase_type && (
+                <div className="text-xs text-muted-foreground mt-1 font-mono">
+                  类型: {phaseLabel(data.phase_type, allTemplates?.find(t => t.type === data.phase_type)?.label)}
+                </div>
               )}
             </div>
-
-            {/* SP-RG-4: 绑定到 Phase Instance (按当前 phase_type 过滤) */}
-            {(() => {
-              const filtered = (phaseInstances || []).filter(inst => inst.phase_class === data.phase_type);
-              return (
-                <div>
-                  <Label className="text-sm">绑定 Phase Instance</Label>
-                  <select
-                    value={data.instance_id || ''}
-                    onChange={e => {
-                      const instId = e.target.value;
-                      if (!instId) {
-                        updateData({ instance_id: undefined });
-                        return;
-                      }
-                      const inst = filtered.find(i => i.instance_id === instId);
-                      if (!inst) { updateData({ instance_id: instId }); return; }
-                      const params = { ...(template?.default_params || {}), ...inst.params_override };
-                      updateData({
-                        instance_id: instId,
-                        params,
-                        ...(inst.label ? { label: inst.label } : {}),
-                      });
-                    }}
-                    className="h-7 w-full text-sm font-mono mt-1 rounded bg-background border border-border px-1"
-                  >
-                    <option value="">无 (使用模板默认)</option>
-                    {filtered.map(inst => (
-                      <option key={inst.instance_id} value={inst.instance_id}>
-                        {inst.instance_id} {inst.label ? `— ${inst.label}` : ''} @ {inst.reactor_id}
-                      </option>
-                    ))}
-                  </select>
-                  {filtered.length === 0 && data.phase_type && (
-                    <div className="text-xs text-muted-foreground mt-1">
-                      无 {data.phase_type} 类型的 instance — 去 <a href="/phase-instances" target="_blank" className="text-blue-500 underline">/phase-instances</a> 创建
-                    </div>
-                  )}
-                </div>
-              );
-            })()}
 
             <div>
               <Label className="text-sm">显示名</Label>
