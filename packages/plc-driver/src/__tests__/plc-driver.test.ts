@@ -6,7 +6,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { parseAddr, byteLen, decode, encode, scale, unscale, groupByRegion, validateAddr } from '../utils';
-import type { PLCVariableMapping } from '../types';
+import { prepareWrite } from '../write-helpers';
+import type { PLCVariableMapping, PLCConnectionConfig } from '../types';
 
 // ─── 地址解析 ───────────────────────────────────────────────
 
@@ -295,5 +296,87 @@ describe('validateAddr', () => {
   });
   it('INT16 + V200.0 拒绝 (非BOOL不能用位地址)', () => {
     expect(validateAddr('V200.0', 'INT16').valid).toBe(false);
+  });
+});
+
+// ─── SP-PLC-2: prepareWrite ─────────────────────────────────
+
+describe('prepareWrite (SP-PLC-2)', () => {
+  const mkVar = (overrides: Partial<PLCVariableMapping> = {}): PLCVariableMapping => ({
+    id: 'v1', tag_name: 'Temp_T1', description: '', plc_address: 'DB1.DBW4',
+    data_type: 'INT16', direction: 'READWRITE', scaling_enabled: true,
+    raw_min: 0, raw_max: 32767, eng_min: 0, eng_max: 100, eng_unit: '°C',
+    group: '', poll_rate_ms: 1000, enabled: true, connection_id: 'c1',
+    ...overrides,
+  });
+  const mkConn = (overrides: Partial<PLCConnectionConfig> = {}): PLCConnectionConfig => ({
+    id: 'c1', name: 'F01-PLC', protocol: 's7', ip: '192.168.1.10', port: 102,
+    enabled: true, s7_db: 1, rack: 0, slot: 1,
+    heartbeat_write_address: 'VB400', heartbeat_read_address: 'VB401',
+    heartbeat_timeout_ms: 5000, reconnect_interval_ms: 3000,
+    ...overrides,
+  });
+
+  it('confirmed !== true → 400 confirmation required', () => {
+    const r = prepareWrite('v1', { value: 1, confirmed: false }, [mkVar()], [mkConn()]);
+    expect(r).toEqual({ ok: false, status: 400, error: 'confirmation required' });
+  });
+
+  it('value 非数字 → 400', () => {
+    const r = prepareWrite('v1', { value: 'oops', confirmed: true } as any, [mkVar()], [mkConn()]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.status).toBe(400);
+  });
+
+  it('variable 不存在 → 404', () => {
+    const r = prepareWrite('missing', { value: 50, confirmed: true }, [mkVar()], [mkConn()]);
+    expect(r).toEqual({ ok: false, status: 404, error: 'variable not found' });
+  });
+
+  it('direction=READ → 400 read-only tag', () => {
+    const r = prepareWrite('v1', { value: 50, confirmed: true }, [mkVar({ direction: 'READ' })], [mkConn()]);
+    expect(r).toEqual({ ok: false, status: 400, error: 'read-only tag' });
+  });
+
+  it('data_type=BOOL → 400 not yet supported', () => {
+    const r = prepareWrite('v1', { value: 1, confirmed: true },
+      [mkVar({ data_type: 'BOOL', plc_address: 'V200.0' })], [mkConn()]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/BOOL/);
+  });
+
+  it('地址非法 → 400 address invalid', () => {
+    const r = prepareWrite('v1', { value: 50, confirmed: true },
+      [mkVar({ plc_address: 'Q0.0' })], [mkConn()]);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/address invalid/);
+  });
+
+  it('connection 不存在 → 404 connection not found', () => {
+    const r = prepareWrite('v1', { value: 50, confirmed: true }, [mkVar()], []);
+    expect(r).toEqual({ ok: false, status: 404, error: 'connection not found' });
+  });
+
+  it('成功: INT16 scaled → raw + buf 正确', () => {
+    const r = prepareWrite('v1', { value: 50, confirmed: true }, [mkVar()], [mkConn()]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.raw).toBe(16384);
+      expect(r.buf.length).toBe(2);
+      expect(r.buf.readInt16BE(0)).toBe(16384);
+      expect(r.db).toBe(1);
+      expect(r.parsed.byte).toBe(4);
+    }
+  });
+
+  it('成功: FLOAT32 scaling_disabled → raw=value, 4 bytes', () => {
+    const v = mkVar({ data_type: 'FLOAT32', plc_address: 'DB1.DBD8', scaling_enabled: false });
+    const r = prepareWrite('v1', { value: 3.14, confirmed: true }, [v], [mkConn()]);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.raw).toBeCloseTo(3.14);
+      expect(r.buf.length).toBe(4);
+      expect(r.buf.readFloatBE(0)).toBeCloseTo(3.14);
+    }
   });
 });
