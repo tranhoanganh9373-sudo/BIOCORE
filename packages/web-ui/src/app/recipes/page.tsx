@@ -26,6 +26,13 @@ interface RecipeSummary {
   is_template?: number;
   parent_template_id?: string | null;
   dag_schema_version?: number;
+  vessel_config?: { reactor_id?: string } | null;
+  vessel?: { reactor_id?: string } | null;
+}
+
+// 取 recipe 的目标 reactor (兼容 vessel_config / vessel 两种字段)
+function recipeReactor(r: RecipeSummary): string | null {
+  return r.vessel_config?.reactor_id ?? r.vessel?.reactor_id ?? null;
 }
 
 // M3.7: 根据 dag_schema_version 路由到不同编辑器
@@ -60,6 +67,8 @@ export default function RecipeListPage() {
 
   // M3.3: 配方/模板 tabs
   const [tab, setTab] = useState<RecipeTab>('recipes');
+  // 按罐子过滤 (null = 全部, 'unassigned' = 未绑定)
+  const [selectedReactor, setSelectedReactor] = useState<string | null>(null);
 
   // 配方列表: recipes tab 不含归档/废弃; deprecated tab 只含废弃; templates 原样
   const loadRecipes = () => {
@@ -305,13 +314,18 @@ export default function RecipeListPage() {
     setDownloading(false);
   };
 
-  const filtered = search.trim()
+  const searched = search.trim()
     ? recipes.filter(r =>
         r.recipe_id.toLowerCase().includes(search.toLowerCase()) ||
         r.name.toLowerCase().includes(search.toLowerCase()) ||
         (r.target_organism ?? '').toLowerCase().includes(search.toLowerCase())
       )
     : recipes;
+  const filtered = selectedReactor === null
+    ? searched
+    : selectedReactor === '__unassigned__'
+      ? searched.filter(r => !recipeReactor(r))
+      : searched.filter(r => recipeReactor(r) === selectedReactor);
 
   return (
     <div className="p-6 space-y-6 max-w-6xl mx-auto">
@@ -368,6 +382,47 @@ export default function RecipeListPage() {
           <Ban className="w-3 h-3" /> 废弃
         </button>
       </div>
+
+      {/* 按罐子分页 — 每个 reactor 一个 pill,显示该罐配方数 */}
+      {reactorIds.length > 0 && (
+        <div className="flex flex-wrap gap-1 border-b pb-2">
+          <button
+            onClick={() => setSelectedReactor(null)}
+            className={`px-3 py-1 text-sm rounded ${selectedReactor === null
+              ? 'bg-primary text-primary-foreground'
+              : 'text-muted-foreground hover:bg-muted'}`}
+          >
+            全部 ({searched.length})
+          </button>
+          {reactorIds.map(rid => {
+            const count = searched.filter(r => recipeReactor(r) === rid).length;
+            return (
+              <button key={rid}
+                onClick={() => setSelectedReactor(rid)}
+                className={`px-3 py-1 text-sm rounded font-mono ${selectedReactor === rid
+                  ? 'bg-primary text-primary-foreground'
+                  : 'text-muted-foreground hover:bg-muted'}`}
+              >
+                {rid} ({count})
+              </button>
+            );
+          })}
+          {(() => {
+            const unassigned = searched.filter(r => !recipeReactor(r)).length;
+            if (unassigned === 0) return null;
+            return (
+              <button
+                onClick={() => setSelectedReactor('__unassigned__')}
+                className={`px-3 py-1 text-sm rounded ${selectedReactor === '__unassigned__'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'text-muted-foreground hover:bg-muted'}`}
+              >
+                未绑定 ({unassigned})
+              </button>
+            );
+          })()}
+        </div>
+      )}
 
       {/* 搜索 */}
       <div className="relative w-full max-w-sm">
