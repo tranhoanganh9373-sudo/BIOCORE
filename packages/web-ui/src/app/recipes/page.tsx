@@ -11,6 +11,7 @@ import { useAudit } from '@/hooks/useAudit';
 import { apiFetch } from '@/lib/auth';
 import { RecipeHistoryDrawer } from '@/components/recipes/RecipeHistoryDrawer';
 import { useLocale } from '@/i18n/useLocale';
+import { PageHeader } from '@/components/layout/PageHeader';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
@@ -328,16 +329,12 @@ export default function RecipeListPage() {
       : searched.filter(r => recipeReactor(r) === selectedReactor);
 
   return (
-    <div className="p-6 space-y-6 max-w-6xl mx-auto">
-      {/* 标题 */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-bold tracking-tight flex items-center gap-2 text-foreground">
-            <BookOpen className="w-5 h-5 text-primary" /> 配方管理
-          </h1>
-          <p className="text-sm text-muted-foreground mt-1">创建和管理发酵配方</p>
-        </div>
-        <div className="flex items-center gap-2">
+    <div className="p-6 space-y-6">
+      <PageHeader
+        icon={BookOpen}
+        title="配方管理"
+        subtitle="创建和管理发酵配方"
+        right={<>
           <button onClick={() => router.push('/recipes/new/edit-v2')}
             className="flex items-center gap-1.5 h-8 px-3 rounded text-sm font-medium bg-purple-600 text-white hover:bg-purple-700">
             <Plus className="w-3.5 h-3.5" /> 新建 DAG 配方
@@ -346,8 +343,8 @@ export default function RecipeListPage() {
             className="flex items-center gap-1.5 h-8 px-3 rounded text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90">
             <Plus className="w-3.5 h-3.5" /> 新建配方
           </button>
-        </div>
-      </div>
+        </>}
+      />
 
       {/* M3.3: 配方 / 模板 tabs */}
       <div className="flex items-center gap-1 border-b border-border">
