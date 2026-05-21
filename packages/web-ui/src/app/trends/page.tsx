@@ -7,6 +7,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import dynamic from 'next/dynamic';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -17,8 +18,14 @@ import { buildTrendOption, buildFacetedTrendOption, PARAM_LABELS, PARAM_UNITS } 
 import type { TrendSeries } from '@/lib/echarts-helpers';
 import { alignByElapsedSeconds, generateSeriesPalette } from '@/lib/trend-utils';
 import { buildSampleScatterSeries, SAMPLE_ANALYTES } from '@/lib/sample-overlay';
-import { CusumHistoryPanel } from '@/components/trends/CusumHistoryPanel';
 import { useLocale } from '@/i18n/useLocale';
+
+// 懒加载 CusumHistoryPanel — 它只在选定具体批次后才渲染,
+// 静态 import 会让 /trends 首次访问拖额外的 chunk.
+const CusumHistoryPanel = dynamic(
+  () => import('@/components/trends/CusumHistoryPanel').then(m => ({ default: m.CusumHistoryPanel })),
+  { ssr: false, loading: () => <div className="p-4 text-sm text-muted-foreground">CUSUM 历史加载中...</div> },
+);
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
