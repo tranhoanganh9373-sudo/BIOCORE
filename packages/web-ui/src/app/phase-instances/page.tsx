@@ -198,12 +198,23 @@ interface FormState {
   notes: string;
 }
 
+function nextInstanceId(existing: string[]): string {
+  // 找出形如 "instance<N>" 的最大 N,返回 instance(N+1)
+  let maxN = 0;
+  for (const id of existing) {
+    const m = /^instance(\d+)$/i.exec(id);
+    if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
+  }
+  return `instance${maxN + 1}`;
+}
+
 function PhaseInstanceDialog({
-  initial, classes, reactors, isEdit, onSave, onCancel,
+  initial, classes, reactors, existingIds = [], isEdit, onSave, onCancel,
 }: {
   initial?: PhaseInstance;
   classes: ClassMeta[];
   reactors: ReactorMeta[];
+  existingIds?: string[];
   isEdit?: boolean;
   onSave: (form: FormState) => void | Promise<void>;
   onCancel: () => void;
@@ -215,7 +226,7 @@ function PhaseInstanceDialog({
     return { ...(cls?.default_params ?? {}), ...(initial?.params_override ?? {}) };
   })();
   const [form, setForm] = useState<FormState>(() => ({
-    instance_id: initial?.instance_id ?? '',
+    instance_id: initial?.instance_id ?? (isEdit ? '' : nextInstanceId(existingIds)),
     phase_class: initialClass,
     reactor_id: initial?.reactor_id ?? reactors[0]?.reactor_id ?? '',
     label: initial?.label ?? '',
