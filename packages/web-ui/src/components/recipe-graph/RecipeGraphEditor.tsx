@@ -473,16 +473,44 @@ function RecipeGraphEditorInner({ initialDag, onSave, saving }: Props) {
     setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, data: { ...n.data, ...patch } } : n));
   }, [setNodes]);
 
-  // Phase 模板库按分类分组 (侧栏快捷添加)
-  const templateGroups = useMemo(() => {
-    const map = new Map<string, APIPhaseTemplate[]>();
-    for (const t of apiTemplates) {
-      const cat = t.category || '自定义';
-      if (!map.has(cat)) map.set(cat, []);
-      map.get(cat)!.push(t);
+  // Phase Instance 按 reactor 分组 (侧栏快捷添加 — 配方编辑直接绑实例,不暴露模板库)
+  const instanceGroups = useMemo(() => {
+    const map = new Map<string, APIPhaseInstance[]>();
+    for (const inst of phaseInstances) {
+      const key = inst.reactor_id || '未绑定 reactor';
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(inst);
     }
     return [...map.entries()].map(([title, items]) => ({ title, items }));
-  }, [apiTemplates]);
+  }, [phaseInstances]);
+
+  // 从 Phase Instance 添加节点 — 推断 phase_type, 合并模板默认参数 + instance.params_override
+  const addPhaseFromInstance = useCallback((inst: APIPhaseInstance) => {
+    const id = `n_${Date.now()}`;
+    const tmpl = apiTemplates.find(t => t.type === inst.phase_class);
+    const params: Record<string, any> = { ...(tmpl?.default_params || {}) };
+    (tmpl?.param_schema || []).forEach((f: any) => {
+      const key = f.key || f.plc_tag;
+      if (key && f.default_value !== undefined && !(key in params)) {
+        params[key] = f.default_value;
+      }
+    });
+    Object.assign(params, inst.params_override || {});
+    const newNode: Node = {
+      id,
+      type: 'phase',
+      position: { x: 260, y: 120 + nodes.length * 40 },
+      data: {
+        phase_id: inst.instance_id,
+        phase_type: inst.phase_class,
+        instance_id: inst.instance_id,
+        label: inst.label || tmpl?.label || inst.instance_id,
+        params,
+      },
+    };
+    setNodes(prev => [...prev, newNode]);
+    setSelectedNodeId(id);
+  }, [apiTemplates, phaseInstances, nodes, setNodes]);
 
   return (
     <div className="flex-1 flex overflow-hidden">
@@ -499,48 +527,53 @@ function RecipeGraphEditorInner({ initialDag, onSave, saving }: Props) {
           <Button variant="outline" size="sm" className="w-full justify-start" onClick={addLoopNode}>
             <Repeat className="w-3.5 h-3.5 mr-1.5" />Loop 循环
           </Button>
-          {apiTemplates.length === 0 && (
+          {phaseInstances.length === 0 && (
             <Button variant="outline" size="sm" className="w-full justify-start" onClick={addBlankPhaseNode}>
               <Beaker className="w-3.5 h-3.5 mr-1.5" />空白 Phase
             </Button>
           )}
         </div>
 
-        {/* Phase 模板库 (点击添加节点, 自动填充默认参数) */}
+        {/* Phase Instance 库 (点击添加节点) */}
         <div className="flex-1 overflow-y-auto p-2">
           <div className="text-sm font-semibold text-muted-foreground uppercase mb-2">
-            Phase 模板库 <span className="text-muted-foreground/60">({apiTemplates.length})</span>
+            Phase Instance <span className="text-muted-foreground/60">({phaseInstances.length})</span>
           </div>
-          {templateGroups.map(group => (
+          {instanceGroups.map(group => (
             <div key={group.title} className="mb-3 space-y-1">
-              <div className="text-[12px] font-medium text-muted-foreground/70 uppercase tracking-wider px-1">
+              <div className="text-[12px] font-medium text-muted-foreground/70 uppercase tracking-wider px-1 font-mono">
                 {group.title}
               </div>
-              {group.items.map(tmpl => (
-                <button
-                  key={tmpl.type}
-                  type="button"
-                  onClick={() => addPhaseFromTemplate(tmpl)}
-                  className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded border border-transparent hover:border-border hover:bg-muted/50 text-left text-[12px] group"
-                  title={`添加 ${phaseLabel(tmpl.type, tmpl.label)} 节点 (含 ${tmpl.fixed_steps} 步默认参数)`}
-                >
-                  <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: 'var(--primary, #1677ff)' }} />
-                  <div className="flex-1 min-w-0">
-                    <div className="font-medium truncate">{phaseLabel(tmpl.type, tmpl.label)}</div>
-                    <div className="text-[12px] text-muted-foreground truncate">{tmpl.fixed_steps} steps</div>
-                  </div>
-                  <Plus className="w-3 h-3 text-muted-foreground opacity-0 group-hover:opacity-100 flex-shrink-0" />
-                </button>
-              ))}
+              {group.items.map(inst => {
+                const tmpl = apiTemplates.find(t => t.type === inst.phase_class);
+                return (
+                  <button
+                    key={inst.instance_id}
+                    type="button"
+                    onClick={() => addPhaseFromInstance(inst)}
+                    className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded border border-transparent hover:border-border hover:bg-muted/50 text-left text-[12px] group"
+                    title={`添加 ${inst.instance_id} (${inst.phase_class} @ ${inst.reactor_id})`}
+                  >
+                    <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: 'var(--primary, #1677ff)' }} />
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium truncate font-mono">{inst.instance_id}</div>
+                      <div className="text-[12px] text-muted-foreground truncate">
+                        {inst.label || phaseLabel(inst.phase_class, tmpl?.label)}
+                      </div>
+                    </div>
+                    <Plus className="w-3 h-3 text-muted-foreground opacity-0 group-hover:opacity-100 flex-shrink-0" />
+                  </button>
+                );
+              })}
             </div>
           ))}
-          {apiTemplates.length === 0 && !templatesError && (
+          {phaseInstances.length === 0 && (
             <div className="text-sm text-muted-foreground italic px-1">
-              模板库为空 — 到"系统设置 → Phase 模板配置"添加
+              暂无 Phase Instance — 到 <a href="/phase-instances" target="_blank" className="text-blue-500 underline">/phase-instances</a> 创建
             </div>
           )}
           {templatesError && (
-            <div className="text-sm text-red-600 bg-red-500/10 border border-red-500/40 rounded px-2 py-1.5">
+            <div className="text-sm text-red-600 bg-red-500/10 border border-red-500/40 rounded px-2 py-1.5 mt-2">
               {templatesError}
             </div>
           )}
