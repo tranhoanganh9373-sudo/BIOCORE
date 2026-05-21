@@ -76,7 +76,7 @@ export default function PhaseInstancesPage(): JSX.Element {
   }
 
   return (
-    <div className="p-6 max-w-6xl mx-auto space-y-6">
+    <div className="p-6 space-y-6">
       <PageHeader
         icon={Link2}
         title="Phase Instances"

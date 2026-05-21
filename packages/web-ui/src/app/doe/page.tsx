@@ -176,23 +176,19 @@ export default function DoeListPage() {
     : studies;
 
   return (
-    <div className="p-6 max-w-6xl mx-auto space-y-4">
+    <div className="p-6 space-y-6">
       {audit.dialog}
 
-      {/* 标题 */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-bold flex items-center gap-2">
-            <FlaskConical className="w-5 h-5 text-primary" /> DoE 实验设计
-          </h1>
-          <p className="text-sm text-muted-foreground mt-1">
-            因子筛选 · 响应面建模 · 最优点搜索 · 与配方编辑器双向对接
-          </p>
-        </div>
-        <Button onClick={() => setCreateOpen(true)}>
-          <Plus className="w-4 h-4 mr-1" /> 新建研究
-        </Button>
-      </div>
+      <PageHeader
+        icon={FlaskConical}
+        title="DoE 实验设计"
+        subtitle="因子筛选 · 响应面建模 · 最优点搜索 · 与配方编辑器双向对接"
+        right={
+          <Button onClick={() => setCreateOpen(true)}>
+            <Plus className="w-4 h-4 mr-1" /> 新建研究
+          </Button>
+        }
+      />
 
       {/* 搜索 */}
       <div className="relative w-full max-w-sm">

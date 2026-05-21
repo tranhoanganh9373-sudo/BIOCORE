@@ -153,7 +153,7 @@ export default function ReviewQueuePage() {
   const deprecationCount = pending.filter(r => r.status === 'pending_deprecation').length;
 
   return (
-    <div className="p-6 max-w-6xl mx-auto space-y-6">
+    <div className="p-6 space-y-6">
       {audit.dialog}
 
       <PageHeader

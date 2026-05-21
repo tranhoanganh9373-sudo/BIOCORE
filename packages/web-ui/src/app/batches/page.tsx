@@ -134,7 +134,7 @@ export default function BatchesPage() {
   if (error) return <div className="p-8 text-center text-destructive">{error}</div>;
 
   return (
-    <div className="p-6 max-w-6xl mx-auto space-y-6">
+    <div className="p-6 space-y-6">
       <PageHeader
         icon={FlaskConical}
         title="配方运行"
