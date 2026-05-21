@@ -30,11 +30,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   Plus, Trash2, Upload, Download, TestTube, Wifi, WifiOff,
   Save, FileJson, FileSpreadsheet, RefreshCw, Search, Edit2,
-  AlertCircle, CheckCircle2,
+  AlertCircle, CheckCircle2, Activity,
 } from 'lucide-react';
 import type { PLCConnection, PLCVariableMapping, PLCVariableGroup, PLCDataType, PLCDirection, PLCProtocol } from '@/types';
 import { useAudit } from '@/hooks/useAudit';
 import { useLocale } from '@/i18n/useLocale';
+import { DebugTab } from './DebugTab';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
@@ -91,7 +92,7 @@ const DEFAULT_VARIABLE_TEMPLATES: Partial<PLCVariableMapping>[] = [
 
 export default function PLCConfigPage() {
   const { t } = useLocale();
-  const [activeTab, setActiveTab] = useState<'connections' | 'variables'>('connections');
+  const [activeTab, setActiveTab] = useState<'connections' | 'variables' | 'debug'>('connections');
   const [connections, setConnections] = useState<PLCConnection[]>([]);
   const [variables, setVariables] = useState<PLCVariableMapping[]>([]);
   const [selectedConnection, setSelectedConnection] = useState<string | null>(null);
@@ -518,6 +519,9 @@ export default function PLCConfigPage() {
           <TabsTrigger value="variables">
             <Edit2 className="w-4 h-4 mr-1" /> 变量映射 ({variables.length})
           </TabsTrigger>
+          <TabsTrigger value="debug">
+            <Activity className="w-4 h-4 mr-1" /> 调试
+          </TabsTrigger>
         </TabsList>
 
         {/* ── Tab 1: PLC 连接管理 ── */}
@@ -784,6 +788,17 @@ export default function PLCConfigPage() {
             <span>READWRITE: {variables.filter(v => v.direction === 'READWRITE').length}</span>
             <span>已启用: {variables.filter(v => v.enabled).length}</span>
           </div>
+        </TabsContent>
+
+        {/* ── Tab 3: 调试面板 (SP-PLC-2) ── */}
+        <TabsContent value="debug" className="space-y-4">
+          <DebugTab
+            connections={connections}
+            variables={variables}
+            apiBase={API_BASE}
+            apiFetch={apiFetch}
+            audit={audit}
+          />
         </TabsContent>
       </Tabs>
 
