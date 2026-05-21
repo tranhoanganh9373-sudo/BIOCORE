@@ -73,6 +73,16 @@ interface PhaseInstance {
   label: string;
   params: Record<string, any>;
   expanded: boolean;
+  instance_id?: string;  // SP-RG-4: 绑定的 phase instance id
+}
+
+// SP-RG-4: phase class 绑到 reactor 的中间层
+interface APIPhaseInstance {
+  instance_id: string;
+  phase_class: string;
+  reactor_id: string;
+  label: string | null;
+  params_override: Record<string, unknown>;
 }
 
 type ExecutionMode = 'free' | 'sequential';
@@ -109,38 +119,49 @@ const COLOR_MAP: Record<string, { bg: string; text: string; border: string; dot:
 
 function getColor(c: string) { return COLOR_MAP[c] ?? COLOR_MAP.gray; }
 
-// ─── Phase模板面板 (左侧, 从API加载) ─────────────────────────
+// ─── Phase Instance 面板 (左侧, 从 /api/v1/phase-instances 加载) ─────
+// 配方编辑应直接绑实例,不暴露模板库.
 
-function PhaseTemplatePalette({ templates, onAdd }: { templates: APIPhaseTemplate[]; onAdd: (type: string) => void }) {
-  // 按 category 分组
+function PhaseInstancePalette({
+  instances, templates, onAdd,
+}: {
+  instances: APIPhaseInstance[];
+  templates: APIPhaseTemplate[];
+  onAdd: (inst: APIPhaseInstance) => void;
+}) {
+  // 按 reactor 分组
   const groups = useMemo(() => {
-    const map = new Map<string, APIPhaseTemplate[]>();
-    for (const t of templates) {
-      const cat = t.category || '自定义';
-      if (!map.has(cat)) map.set(cat, []);
-      map.get(cat)!.push(t);
+    const map = new Map<string, APIPhaseInstance[]>();
+    for (const inst of instances) {
+      const key = inst.reactor_id || '未绑定 reactor';
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(inst);
     }
     return [...map.entries()].map(([title, items]) => ({ title, items }));
-  }, [templates]);
+  }, [instances]);
 
   return (
     <div className="w-[240px] flex-shrink-0 border-r overflow-y-auto p-3 space-y-4">
-      <div className="text-sm font-medium text-muted-foreground">Phase 模板库</div>
+      <div className="text-sm font-medium text-muted-foreground">
+        Phase Instance <span className="text-muted-foreground/60">({instances.length})</span>
+      </div>
       <p className="text-sm text-muted-foreground">点击添加到配方时间线</p>
       {groups.map(group => (
         <div key={group.title} className="space-y-1.5">
-          <div className="text-sm font-medium text-muted-foreground uppercase tracking-wider">{group.title}</div>
-          {group.items.map(tmpl => {
-            const type = tmpl.type;
-            const c = getColor(tmpl.color);
+          <div className="text-sm font-medium text-muted-foreground uppercase tracking-wider font-mono">{group.title}</div>
+          {group.items.map(inst => {
+            const tmpl = templates.find(t => t.type === inst.phase_class);
+            const c = getColor(tmpl?.color || 'gray');
             return (
-              <button key={type} onClick={() => onAdd(type)}
+              <button key={inst.instance_id} onClick={() => onAdd(inst)}
                 className="w-full flex items-center gap-2 px-2.5 py-2 rounded-md border border-transparent
                   hover:border-border hover:bg-muted/50 text-left text-sm transition-colors group">
                 <div className={`w-2 h-2 rounded-full ${c.dot} flex-shrink-0`} />
                 <div className="flex-1 min-w-0">
-                  <div className="font-medium truncate">{tmpl.label}</div>
-                  <div className="text-[12px] text-muted-foreground truncate">{tmpl.fixed_steps} Steps</div>
+                  <div className="font-medium truncate font-mono">{inst.instance_id}</div>
+                  <div className="text-[12px] text-muted-foreground truncate">
+                    {inst.label || tmpl?.label || inst.phase_class}
+                  </div>
                 </div>
                 <Plus className="w-3.5 h-3.5 text-muted-foreground opacity-0 group-hover:opacity-100" />
               </button>
@@ -148,6 +169,11 @@ function PhaseTemplatePalette({ templates, onAdd }: { templates: APIPhaseTemplat
           })}
         </div>
       ))}
+      {instances.length === 0 && (
+        <div className="text-sm text-muted-foreground italic">
+          暂无 Phase Instance — 到 <a href="/phase-instances" target="_blank" className="text-blue-500 underline">/phase-instances</a> 创建
+        </div>
+      )}
     </div>
   );
 }
@@ -393,6 +419,7 @@ export default function RecipeEditorPage() {
   const [saveMsg, setSaveMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [apiTemplates, setApiTemplates] = useState<APIPhaseTemplate[]>([]);
+  const [phaseInstances, setPhaseInstances] = useState<APIPhaseInstance[]>([]);
   const audit = useAudit();
 
   // M3.4: 多选 + 剪贴板状态
@@ -441,12 +468,29 @@ export default function RecipeEditorPage() {
     setTimeout(() => setClipboardHint(null), 2500);
   }, []);
 
-  // 从API加载Phase模板
+  // 从API加载Phase模板 (内部用于派生参数 schema, 不暴露给用户)
   useEffect(() => {
     const controller = new AbortController();
     fetch(`${API}/api/phase-templates`, { signal: controller.signal })
       .then(r => r.json())
       .then(data => { if (Array.isArray(data)) setApiTemplates(data); })
+      .catch((err) => { if (err.name !== 'AbortError') console.error(err); });
+    return () => controller.abort();
+  }, []);
+
+  // SP-RG-4: 加载 phase instances (左侧 palette + addPhaseFromInstance 用)
+  useEffect(() => {
+    const controller = new AbortController();
+    const token = typeof window !== 'undefined' ? localStorage.getItem('biocore_token') : null;
+    fetch(`${API}/api/v1/phase-instances`, {
+      signal: controller.signal,
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+      .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+      .then(j => {
+        const data = j && typeof j === 'object' && 'data' in j ? j.data : j;
+        if (Array.isArray(data)) setPhaseInstances(data);
+      })
       .catch((err) => { if (err.name !== 'AbortError') console.error(err); });
     return () => controller.abort();
   }, []);
@@ -500,28 +544,26 @@ export default function RecipeEditorPage() {
     useSensor(KeyboardSensor),
   );
 
-  const addPhase = useCallback((type: string) => {
-    const tmpl = findTemplate(type);
-    if (!tmpl) return;
-    // 合并默认参数: default_params + param_schema中的default_value
-    const params: Record<string, any> = { ...(tmpl.default_params || {}) };
-    (tmpl.param_schema || []).forEach((f: any) => {
+  // 从 Phase Instance 添加 phase row — 推断 phase_class 作 type, 合并模板默认参数 + override
+  const addPhaseFromInstance = useCallback((inst: APIPhaseInstance) => {
+    const tmpl = findTemplate(inst.phase_class);
+    const params: Record<string, any> = { ...(tmpl?.default_params || {}) };
+    (tmpl?.param_schema || []).forEach((f: any) => {
       const key = f.key || f.plc_tag;
       if (key && f.default_value !== undefined && !(key in params)) {
         params[key] = f.default_value;
       }
     });
-    setPhases(prev => {
-      const count = prev.filter(p => p.type === type).length;
-      return [...prev, {
-        id: `${type}_${Date.now()}`,
-        phase_id: `${type.toUpperCase()}_${String(count + 1).padStart(2, '0')}`,
-        type,
-        label: count > 0 ? `${tmpl.label} ${count + 1}` : tmpl.label,
-        params,
-        expanded: true,
-      }];
-    });
+    Object.assign(params, inst.params_override || {});
+    setPhases(prev => [...prev, {
+      id: `${inst.instance_id}_${Date.now()}`,
+      phase_id: inst.instance_id,
+      type: inst.phase_class,
+      instance_id: inst.instance_id,
+      label: inst.label || tmpl?.label || inst.instance_id,
+      params,
+      expanded: true,
+    }]);
   }, [apiTemplates]);
 
   const handleDragEnd = useCallback((event: DragEndEvent) => {
@@ -791,7 +833,7 @@ export default function RecipeEditorPage() {
 
       {/* Main area */}
       <div className="flex-1 flex overflow-hidden">
-        <PhaseTemplatePalette templates={apiTemplates} onAdd={addPhase} />
+        <PhaseInstancePalette instances={phaseInstances} templates={apiTemplates} onAdd={addPhaseFromInstance} />
 
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* Timeline */}
