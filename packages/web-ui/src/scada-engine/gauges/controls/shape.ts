@@ -101,10 +101,15 @@ class ShapeGauge implements GaugeBase {
     if (!this.wrap) return;
     const viewBox = this.wrap.getAttribute('viewBox') ?? '0 0 100 100';
     const parts = viewBox.split(/\s+/).map(Number);
+    // 修复 (SP-FX-FF.50): 旋转中心 = min_x + w/2, min_y + h/2.
+    // 之前漏加 min_x / min_y → eli (viewBox="8 8 84 84") 算成 (42,42),
+    // 实际几何中心 (50,50),叶片绕错位的轴转出椭圆轨迹.
+    const minX = Number.isFinite(parts[0]) ? parts[0] : 0;
+    const minY = Number.isFinite(parts[1]) ? parts[1] : 0;
     const vw = parts[2];
     const vh = parts[3];
-    const cx = (Number.isFinite(vw) ? vw : 100) / 2;
-    const cy = (Number.isFinite(vh) ? vh : 100) / 2;
+    const cx = minX + (Number.isFinite(vw) ? vw : 100) / 2;
+    const cy = minY + (Number.isFinite(vh) ? vh : 100) / 2;
     this.lastTs = 0;
     const tick = (ts: number): void => {
       const g = this.rotateGroup;

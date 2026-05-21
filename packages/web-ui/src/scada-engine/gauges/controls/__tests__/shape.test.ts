@@ -180,6 +180,29 @@ describe('ShapeGauge', () => {
     rafSpy.mockRestore();
   });
 
+  // SP-FX-FF.50: 旋转中心需加 viewBox min_x/min_y 偏移
+  it('rotate transform 用 viewBox min_x/min_y + w/2 作中心 (修复绕错位)', async () => {
+    let calls = 0;
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => {
+      calls++;
+      if (calls === 1) cb(0);
+      return calls;
+    });
+    const { shapeMeta } = await import('../shape');
+    const wrap = makeShapeDom(parent, 'ws1');
+    // 模拟 canvas-svg 设的真实 eli viewBox
+    wrap.setAttribute('viewBox', '8 8 84 84');
+    const ctx = makeCtx(parent);
+    const gauge = shapeMeta.create();
+    gauge.onMount(makeWidget({ property: { shapeName: 'eli', fill: '#aaa', rotateSpeed: 90 } } as unknown as FuxaWidget), ctx);
+    const g = wrap.querySelector('[data-shape-rotate-group]');
+    const tr = g?.getAttribute('transform') ?? '';
+    // rotate(angle cx cy) — 期望 cx=50 cy=50 (8 + 84/2 = 50)
+    expect(tr).toMatch(/rotate\([^ ]+ 50 50\)/);
+    gauge.onUnmount();
+    rafSpy.mockRestore();
+  });
+
   it('onUnmount cancels rotation rAF', async () => {
     const cancelSpy = vi.spyOn(window, 'cancelAnimationFrame');
     const { shapeMeta } = await import('../shape');
