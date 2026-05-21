@@ -2,13 +2,20 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
+import dynamic from 'next/dynamic';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { History, Search } from 'lucide-react';
-import { BatchComparePanel } from '@/components/BatchComparePanel';
 import { useLocale } from '@/i18n/useLocale';
+
+// 懒加载 BatchComparePanel: 它静态 import echarts 与 boxplot helpers,
+// eager 加载会让 '配方运行' 首次访问慢 (打包数千 modules). 切到对比 tab 时再加载.
+const BatchComparePanel = dynamic(
+  () => import('@/components/BatchComparePanel').then(m => ({ default: m.BatchComparePanel })),
+  { ssr: false, loading: () => <div className="p-8 text-center text-muted-foreground">对比面板加载中...</div> },
+);
 
 const API = 'http://localhost:3001';
 
