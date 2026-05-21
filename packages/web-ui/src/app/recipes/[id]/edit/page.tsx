@@ -123,11 +123,12 @@ function getColor(c: string) { return COLOR_MAP[c] ?? COLOR_MAP.gray; }
 // 配方编辑应直接绑实例,不暴露模板库.
 
 function PhaseInstancePalette({
-  instances, templates, onAdd,
+  instances, templates, onAdd, usedIds = new Set(),
 }: {
   instances: APIPhaseInstance[];
   templates: APIPhaseTemplate[];
   onAdd: (inst: APIPhaseInstance) => void;
+  usedIds?: Set<string>;
 }) {
   // 按 reactor 分组
   const groups = useMemo(() => {
@@ -152,18 +153,25 @@ function PhaseInstancePalette({
           {group.items.map(inst => {
             const tmpl = templates.find(t => t.type === inst.phase_class);
             const c = getColor(tmpl?.color || 'gray');
+            const used = usedIds.has(inst.instance_id);
             return (
-              <button key={inst.instance_id} onClick={() => onAdd(inst)}
-                className="w-full flex items-center gap-2 px-2.5 py-2 rounded-md border border-transparent
-                  hover:border-border hover:bg-muted/50 text-left text-sm transition-colors group">
+              <button key={inst.instance_id}
+                onClick={() => !used && onAdd(inst)}
+                disabled={used}
+                title={used ? `${inst.instance_id} 已在配方中` : undefined}
+                className={`w-full flex items-center gap-2 px-2.5 py-2 rounded-md border border-transparent text-left text-sm transition-colors group ${
+                  used
+                    ? 'opacity-40 cursor-not-allowed'
+                    : 'hover:border-border hover:bg-muted/50'
+                }`}>
                 <div className={`w-2 h-2 rounded-full ${c.dot} flex-shrink-0`} />
                 <div className="flex-1 min-w-0">
                   <div className="font-medium truncate font-mono">{inst.instance_id}</div>
                   <div className="text-[12px] text-muted-foreground truncate">
-                    {inst.label || tmpl?.label || inst.phase_class}
+                    {used ? '已添加' : (inst.label || tmpl?.label || inst.phase_class)}
                   </div>
                 </div>
-                <Plus className="w-3.5 h-3.5 text-muted-foreground opacity-0 group-hover:opacity-100" />
+                {!used && <Plus className="w-3.5 h-3.5 text-muted-foreground opacity-0 group-hover:opacity-100" />}
               </button>
             );
           })}
@@ -546,6 +554,8 @@ export default function RecipeEditorPage() {
 
   // 从 Phase Instance 添加 phase row — 推断 phase_class 作 type, 合并模板默认参数 + override
   const addPhaseFromInstance = useCallback((inst: APIPhaseInstance) => {
+    // 防御: 配方中同一 instance 不可重复
+    if (phases.some(p => p.instance_id === inst.instance_id)) return;
     const tmpl = findTemplate(inst.phase_class);
     const params: Record<string, any> = { ...(tmpl?.default_params || {}) };
     (tmpl?.param_schema || []).forEach((f: any) => {
@@ -564,7 +574,7 @@ export default function RecipeEditorPage() {
       params,
       expanded: true,
     }]);
-  }, [apiTemplates]);
+  }, [apiTemplates, phases, findTemplate]);
 
   const handleDragEnd = useCallback((event: DragEndEvent) => {
     setActiveId(null);
@@ -833,7 +843,12 @@ export default function RecipeEditorPage() {
 
       {/* Main area */}
       <div className="flex-1 flex overflow-hidden">
-        <PhaseInstancePalette instances={phaseInstances} templates={apiTemplates} onAdd={addPhaseFromInstance} />
+        <PhaseInstancePalette
+          instances={phaseInstances}
+          templates={apiTemplates}
+          onAdd={addPhaseFromInstance}
+          usedIds={new Set(phases.map(p => p.instance_id).filter((x): x is string => !!x))}
+        />
 
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* Timeline */}

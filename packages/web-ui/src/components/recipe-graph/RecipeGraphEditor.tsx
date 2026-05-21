@@ -473,6 +473,15 @@ function RecipeGraphEditorInner({ initialDag, onSave, saving }: Props) {
     setNodes(prev => prev.map(n => n.id === nodeId ? { ...n, data: { ...n.data, ...patch } } : n));
   }, [setNodes]);
 
+  // 已在画布上的 instance_id — palette 中标灰禁止重复添加
+  const usedInstanceIds = useMemo(
+    () => new Set(nodes
+      .filter(n => n.type === 'phase')
+      .map(n => (n.data as any)?.instance_id as string | undefined)
+      .filter((x): x is string => !!x)),
+    [nodes],
+  );
+
   // Phase Instance 按 reactor 分组 (侧栏快捷添加 — 配方编辑直接绑实例,不暴露模板库)
   const instanceGroups = useMemo(() => {
     const map = new Map<string, APIPhaseInstance[]>();
@@ -486,6 +495,10 @@ function RecipeGraphEditorInner({ initialDag, onSave, saving }: Props) {
 
   // 从 Phase Instance 添加节点 — 推断 phase_type, 合并模板默认参数 + instance.params_override
   const addPhaseFromInstance = useCallback((inst: APIPhaseInstance) => {
+    // 防御: 配方中同一 instance 不可重复
+    if (nodes.some(n => n.type === 'phase' && (n.data as any)?.instance_id === inst.instance_id)) {
+      return;
+    }
     const id = `n_${Date.now()}`;
     const tmpl = apiTemplates.find(t => t.type === inst.phase_class);
     const params: Record<string, any> = { ...(tmpl?.default_params || {}) };
@@ -546,22 +559,28 @@ function RecipeGraphEditorInner({ initialDag, onSave, saving }: Props) {
               </div>
               {group.items.map(inst => {
                 const tmpl = apiTemplates.find(t => t.type === inst.phase_class);
+                const used = usedInstanceIds.has(inst.instance_id);
                 return (
                   <button
                     key={inst.instance_id}
                     type="button"
-                    onClick={() => addPhaseFromInstance(inst)}
-                    className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded border border-transparent hover:border-border hover:bg-muted/50 text-left text-[12px] group"
-                    title={`添加 ${inst.instance_id} (${inst.phase_class} @ ${inst.reactor_id})`}
+                    onClick={() => !used && addPhaseFromInstance(inst)}
+                    disabled={used}
+                    className={`w-full flex items-center gap-1.5 px-2 py-1.5 rounded border border-transparent text-left text-[12px] group ${
+                      used
+                        ? 'opacity-40 cursor-not-allowed'
+                        : 'hover:border-border hover:bg-muted/50'
+                    }`}
+                    title={used ? `${inst.instance_id} 已在配方中` : `添加 ${inst.instance_id} (${inst.phase_class} @ ${inst.reactor_id})`}
                   >
                     <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: 'var(--primary, #1677ff)' }} />
                     <div className="flex-1 min-w-0">
                       <div className="font-medium truncate font-mono">{inst.instance_id}</div>
                       <div className="text-[12px] text-muted-foreground truncate">
-                        {inst.label || phaseLabel(inst.phase_class, tmpl?.label)}
+                        {used ? '已添加' : (inst.label || phaseLabel(inst.phase_class, tmpl?.label))}
                       </div>
                     </div>
-                    <Plus className="w-3 h-3 text-muted-foreground opacity-0 group-hover:opacity-100 flex-shrink-0" />
+                    {!used && <Plus className="w-3 h-3 text-muted-foreground opacity-0 group-hover:opacity-100 flex-shrink-0" />}
                   </button>
                 );
               })}
