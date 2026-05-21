@@ -26,6 +26,8 @@ function buildNavItems(t: (key: string) => string) {
       { href: '/trends', icon: LineChart, label: t('nav.trends') },
     ]},
     { href: '/recipes', icon: BookOpen, label: t('nav.recipes'), children: [
+      { href: '/recipes/new/edit-v2', icon: FileText, label: t('nav.recipe-edit') },
+      { href: '/batches', icon: FlaskConical, label: t('nav.recipe-run') },
       { href: '/recipes/review-queue', icon: ShieldCheck, label: t('nav.review-queue') },
       { href: '/phase-instances', icon: Link2, label: t('nav.phase-instances') },
       { href: '/doe', icon: Sigma, label: t('nav.doe') },
