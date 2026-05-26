@@ -15,24 +15,32 @@
 // behavior preserved from the previous module-top placement in index.ts.
 // ============================================================
 
-// EXCEPTION (v1.8.0 bucket 2): These deep imports are intentional and remain
-// after the cross-package import cleanup. The @biocore/plc-driver barrel
-// (src/index.ts) eagerly imports node-snap7 (a native binding) and
-// modbus-serial at module load. The server only needs the pure-JS utility
-// helpers and types — it has its own dynamic loader for S7Client. Importing
-// from the barrel would force-load node-snap7 native bindings on Node hosts
-// without the compiled .node file (e.g. tsx dev, MOCK_PLC environments).
+// NOTE: We import from the dedicated pure-JS sub-entry @biocore/plc-driver/utils
+// rather than the main barrel (.) because the barrel (src/index.ts) eagerly
+// imports node-snap7 (a native binding) and modbus-serial at module load. The
+// server only needs the pure-JS utility helpers and types — it has its own
+// dynamic loader for S7Client. Importing from the barrel would force-load
+// node-snap7 native bindings on Node hosts without the compiled .node file
+// (e.g. tsx dev, MOCK_PLC environments).
 //
-// TODO (post-v1.8.0): split @biocore/plc-driver into a pure-JS sub-entry
-// (e.g. @biocore/plc-driver/utils via the package.json `exports` map) so
-// these consumers can use a documented public sub-path. For now the deep
-// import is the lesser evil — see release notes for ESLint rule plan that
-// will need to whitelist this exception or move it behind a sub-entry.
-import { parseAddr, byteLen, decode, scale, validateAddr } from '../../plc-driver/src/utils';
-import { VariableMappingManager } from '../../plc-driver/src/variable-mapping';
-import { prepareWrite } from '../../plc-driver/src/write-helpers';
-import type { WritePrep, WriteSuccess } from '../../plc-driver/src/write-helpers';
-import type { PLCConnectionConfig, PLCVariableMapping } from '../../plc-driver/src/types';
+// ✅ post-v1.8.0: now uses @biocore/plc-driver/utils sub-entry (package.json
+// `exports` map). The previous deep import (../../plc-driver/src/...) hack
+// has been removed.
+import {
+  parseAddr,
+  byteLen,
+  decode,
+  scale,
+  validateAddr,
+  VariableMappingManager,
+  prepareWrite,
+} from '@biocore/plc-driver/utils';
+import type {
+  WritePrep,
+  WriteSuccess,
+  PLCConnectionConfig,
+  PLCVariableMapping,
+} from '@biocore/plc-driver/utils';
 
 export { parseAddr, byteLen, decode, scale, validateAddr, VariableMappingManager, prepareWrite };
 export type { PLCConnectionConfig, PLCVariableMapping, WritePrep, WriteSuccess };
