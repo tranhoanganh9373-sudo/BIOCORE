@@ -1,6 +1,6 @@
 # SP-PLC-3 Tag Cache & OPC-style Subscription — Phase 3c (横向扩展)
 
-**Status:** Shipped 2026-05-26 (P3c.1=`4952067`, P3c.2=`902836b`, P3c.3=`b206a87`, P3c.4=`d062d2a`, P3c.5=pending). Phase 3c 完成。
+**Status:** Shipped 2026-05-26 (P3c.1=`4952067`, P3c.2=`902836b`, P3c.3=`b206a87`, P3c.4=`d062d2a`, P3c.5=6867e8b). Phase 3c 完成。
 **Target version:** v1.19.0
 **Estimated:** ~1200 LOC, 5 commits, +37 tests, 9–13h single-engineer
 **Scope tier:** Phase 3c (Redis + reliable queue + ack). Depends on Phase 3b (TBD).
