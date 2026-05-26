@@ -3253,6 +3253,19 @@ apiRouter.post('/settings/data-maintenance/cleanup', (req, res) => {
 // so that listener call sites can immediately use getAuditQueue().
 initAuditQueue(sqlite);
 
+// ─── SP-PLC-3 P2: TagCache + PollingScheduler 接入 (plan §1 Commit 2) ───
+// 模块顶层创建 cache + scheduler 注册表; 真实 scheduler 实例化在 start()
+// 内 await (需要先 await migrationsReady, 否则查 plc_reactor_bindings 撞
+// 空 schema). pollingSchedulers Map 传引用给 createReactorWiring, 启动期
+// 填充后, reactor-wiring 闭包按 reactorId 查表选 mock / 真实路径.
+import { TagCache } from './engine/tag-cache';
+// 仅引 type, 避免顶层 import 触发 @biocore/plc-driver 主 entry 加载
+// (含 node-snap7 native binding, dev/test 环境无 native build 会 crash).
+// 真实实例由 start() 内 dynamic import 创建, 仅 MOCK_PLC=false 走此路径.
+import type { PollingScheduler } from '@biocore/plc-driver';
+const tagCache = new TagCache();
+const pollingSchedulers = new Map<string, PollingScheduler>();
+
 const {
   startReactorCollector,
   stopReactorCollector,
@@ -3262,6 +3275,8 @@ const {
   influxWriteApi,
   broadcast,
   autoCollectDoeResponses,
+  tagCache,
+  pollingSchedulers,
 });
 
 // route-handler-split (post v1.12.0): single buildReactorConfig factory
@@ -3570,6 +3585,54 @@ async function start(): Promise<void> {
   });
   process.on('SIGTERM', () => scadaDispatcherHandle.stop());
   process.on('SIGINT', () => scadaDispatcherHandle.stop());
+
+  // ─── SP-PLC-3 P2: PollingScheduler 启动 (plan §1 Commit 2 + §2a) ───
+  // 仅生产模式启动 (MOCK_PLC=true 时 reactor-wiring 走 buildMockSnapshot,
+  // 跟 plan §6 Q-v 候选 A 一致). 动态 import 隔离 native binding 加载:
+  // dev 环境 (无 node-snap7 native build) 不会因 require 期错误而 crash.
+  // 失败的 reactor 自动退化 mock 路径 (Promise.allSettled + try/catch).
+  if (!MOCK_PLC) {
+    try {
+      const plcDriver = await import('@biocore/plc-driver');
+      const { PLCConnectionManager, PollingScheduler } = plcDriver;
+      const reactors = reactorManager.listReactors();
+      const startPromises = reactors.map(async (reactor) => {
+        try {
+          // plan §B getReactorPLCConnection helper 不存在 — 走现有
+          // sqlite.getPlcReactorBindingsByReactor + varManager.getConnections 组合.
+          const bindings = sqlite.getPlcReactorBindingsByReactor(reactor.id);
+          if (bindings.length === 0) return;  // 无 PLC 绑定 → 走 mock 路径
+          const plcId = bindings[0].plc_id;
+          const conn = varManager.getConnections().find((c: PLCConnectionConfig) => c.id === plcId);
+          if (!conn) {
+            console.warn(`[${new Date().toISOString()}] [WARN] [scheduler:${reactor.id}] plc_id=${plcId} 未在 plc_connections 表找到, 退化 mock 路径`);
+            return;
+          }
+          const mgr = new PLCConnectionManager(conn);
+          mgr.setVariables(varManager.getVariables(plcId));
+          await mgr.connect();
+          const scheduler = new PollingScheduler(mgr);
+          scheduler.on('snapshot', (snap: any) => tagCache.write(reactor.id, snap));
+          scheduler.on('error', (err: any) => {
+            console.error(`[${new Date().toISOString()}] [ERROR] [scheduler:${reactor.id}]`, err);
+            tagCache.markStale(reactor.id);
+          });
+          scheduler.start();
+          pollingSchedulers.set(reactor.id, scheduler);
+          console.log(`[${new Date().toISOString()}] [INFO] [scheduler:${reactor.id}] PollingScheduler 已启动 (plc_id=${plcId})`);
+        } catch (err) {
+          console.warn(`[${new Date().toISOString()}] [WARN] [scheduler:${reactor.id}] 启动失败, 退化 mock 路径:`, (err as Error).message);
+        }
+      });
+      await Promise.allSettled(startPromises);
+    } catch (err) {
+      console.warn(`[${new Date().toISOString()}] [WARN] [scheduler] 模块加载失败 (可能 native binding 缺失), 全部 reactor 退化 mock 路径:`, (err as Error).message);
+    }
+  }
+  // SIGTERM/SIGINT: 停止所有 PollingScheduler 的 setInterval timer
+  // (跟现有 gracefulShutdown / scadaDispatcher 钩子并存, 各 handler 独立).
+  process.on('SIGTERM', () => pollingSchedulers.forEach((s) => s.stop()));
+  process.on('SIGINT', () => pollingSchedulers.forEach((s) => s.stop()));
   server.listen(PORT, () => {
   console.log(`
   ╔══════════════════════════════════════════════╗

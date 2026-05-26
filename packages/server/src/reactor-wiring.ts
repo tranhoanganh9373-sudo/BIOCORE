@@ -30,10 +30,17 @@ import { getAuditQueue } from './audit-queue';
 
 import { ReactorManager } from '@biocore/batch-engine';
 
-import { devPlcRead } from './plc-bridge';
+import { devPlcRead, MOCK_PLC } from './plc-bridge';
 import { softSensorEngine, getCusumKey, clearCusumDetectors } from './ai-wiring';
 import { initCusumBaselines } from './cusum-routes';
 import { computeAndStore as computeKpi } from './kpi-routes';
+// SP-PLC-3 P2: TagCache + PollingScheduler 接入 (plan §1 Commit 2)
+import { TagCache, type SnapshotInput } from './engine/tag-cache';
+// PollingScheduler 类型仅用于参数 typing; 真实实例由 index.ts 启动期注入
+// (主 entry 含 node-snap7 native binding, 不能在 server 顶层直接 import —
+//  index.ts 用 dynamic import 隔离). 这里只引 type, type-only import 编译期
+//  消解, 不会触发 native 加载.
+import type { PollingScheduler } from '@biocore/plc-driver';
 
 // ─── Module-load singletons & state (matches old index.ts semantics) ─
 export const reactorManager = new ReactorManager();
@@ -76,6 +83,38 @@ export interface ReactorWiringDeps {
   influxWriteApi: WriteApi | null;
   broadcast: (channel: string, payload: any, batchId?: string | null, reactorId?: string | null) => void;
   autoCollectDoeResponses: (db: any, studyId: string, runIndex: number) => Record<string, number> | null;
+  // SP-PLC-3 P2: TagCache 必传, 所有 tag 读写统一走 cache (plan §1 Commit 2).
+  tagCache: TagCache;
+  // SP-PLC-3 P2 (Q5): pollingSchedulers 可选; MOCK_PLC 或某 reactor 无 PLC
+  // 绑定时不创建 scheduler, reactor-wiring 走 buildMockSnapshot 写 cache.
+  pollingSchedulers?: Map<string, PollingScheduler>;
+}
+
+/**
+ * SP-PLC-3 P2: 用 devPlcRead 拼 mock snapshot, shape 与 PollingScheduler
+ * emit 的 ProcessSnapshot 一致 (plan §1 Commit 2 + §2g 行为等价不变).
+ *
+ * 关键 invariant: `buildMockSnapshot(TAGS, r).values[tag]` 对每个 tag 等于
+ * `devPlcRead(tag)` (catch 后 0 兜底), 保持 MOCK_PLC 演示路径行为不变.
+ */
+export function buildMockSnapshot(tags: readonly string[], _reactorId: string): SnapshotInput {
+  const values: Record<string, number> = {};
+  const quality: Record<string, 'good' | 'bad' | 'uncertain'> = {};
+  for (const tag of tags) {
+    try {
+      values[tag] = devPlcRead(tag);
+    } catch {
+      // 旧路径在 catch 后写 0 (line 119 of pre-P2). MOCK 环境无通讯故障概念,
+      // 同步落 quality='good' 跟旧 broadcast/influx 行为一致.
+      values[tag] = 0;
+    }
+    quality[tag] = 'good';
+  }
+  return {
+    timestamp: new Date().toISOString(),
+    values,
+    quality,
+  };
 }
 
 export interface ReactorWiringHandles {
@@ -85,7 +124,7 @@ export interface ReactorWiringHandles {
 }
 
 export function createReactorWiring(deps: ReactorWiringDeps): ReactorWiringHandles {
-  const { sqlite, influxWriteApi, broadcast, autoCollectDoeResponses } = deps;
+  const { sqlite, influxWriteApi, broadcast, autoCollectDoeResponses, tagCache, pollingSchedulers } = deps;
 
   // 启动单个反应器的时序采集 (60秒一次写入 InfluxDB)
   function startReactorCollector(reactorId: string): void {
@@ -114,9 +153,20 @@ export function createReactorWiring(deps: ReactorWiringDeps): ReactorWiringHandl
           'P01_RATE', 'P02_RATE', 'P03_RATE', 'P04_RATE',
           'TEMP_SV', 'PH_SV', 'DO_SV',
         ];
+        // SP-PLC-3 P2: 数据采集统一走 TagCache.
+        //   - MOCK_PLC 或 reactor 无 PLC 绑定 → 内联 buildMockSnapshot 写入 cache
+        //     (保留旧 mock 演示路径行为, plan §2g);
+        //   - 真实 PLC 绑定 → 由启动期 PollingScheduler.on('snapshot', ...) 异步
+        //     写入 cache, 本 tick 直接从 cache 读最新值 (cache 暖机期
+        //     1×poll_rate_ms 内可能为空, 落 0 兜底跟旧行为一致, plan §2b).
+        if (MOCK_PLC || !pollingSchedulers?.get(reactorId)) {
+          tagCache.write(reactorId, buildMockSnapshot(TAGS, reactorId));
+        }
+        const entries = tagCache.readAll(reactorId);
         const rawPV: Record<string, number> = {};
         for (const tag of TAGS) {
-          try { rawPV[tag] = devPlcRead(tag); } catch { rawPV[tag] = 0; }
+          const entry = entries[tag];
+          rawPV[tag] = entry ? entry.value : 0;
         }
         const rpmRaw = rawPV['VFD_ACTUAL_FREQ'] * 24;
 
