@@ -1,7 +1,9 @@
 // SP-PLC-3 Phase 1 Commit 1 — TagCache 单元测试 (15 项)
+// SP-PLC-3 Phase 2 Commit 1 (P2.1) — per-tag deadband 扩展 (+5 项 → 20 项)
 // 计划: docs/plans/SP-PLC-3-tag-cache-plan.md  §1 Commit 1 "测试覆盖"
+//      docs/plans/SP-PLC-3-tag-cache-phase2-plan.md  §1 Commit 1 "测试覆盖"
 import { describe, it, expect, beforeEach } from 'vitest';
-import { TagCache, type CacheChange } from '../tag-cache';
+import { TagCache, type CacheChange, type DeadbandResolver } from '../tag-cache';
 
 const TS1 = '2026-05-25T00:00:00.000Z';
 const TS2 = '2026-05-25T00:00:01.000Z';
@@ -174,5 +176,122 @@ describe('TagCache', () => {
     expect(() => cache.write('R1', snap({ TEMP_PV: 37.0 }))).not.toThrow();
     expect(goodReceived).toHaveLength(1);
     expect(goodReceived[0][0].tag).toBe('TEMP_PV');
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────
+// SP-PLC-3 P2.1: per-tag deadband (5 新 tests + 1 除零守卫 = 6 tests)
+// ────────────────────────────────────────────────────────────────────
+describe('TagCache - SP-PLC-3 P2.1 per-tag deadband', () => {
+  let cache: TagCache;
+  beforeEach(() => { cache = new TagCache(); });
+
+  it('per-tag deadband_abs 触发 change (|Δ| > abs)', () => {
+    // resolver 全 tag 返 abs=0.5 pct=0
+    const resolver: DeadbandResolver = () => ({ abs: 0.5, pct: 0 });
+    cache.write('R1', snap({ TEMP_PV: 37.0 }, undefined, TS1), { deadbandResolver: resolver });
+
+    // Δ=0.4 (< abs) → 不返 change
+    const c1 = cache.write('R1', snap({ TEMP_PV: 37.4 }, undefined, TS2), { deadbandResolver: resolver });
+    expect(c1).toHaveLength(0);
+    expect(cache.read('R1', 'TEMP_PV')!.value).toBe(37.0);
+
+    // Δ=0.5 (边界, 等于视为同值) → 不返 change
+    const c2 = cache.write('R1', snap({ TEMP_PV: 37.5 }, undefined, TS3), { deadbandResolver: resolver });
+    expect(c2).toHaveLength(0);
+    expect(cache.read('R1', 'TEMP_PV')!.value).toBe(37.0);
+
+    // Δ=0.6 (> abs) → 返 change
+    const c3 = cache.write('R1', snap({ TEMP_PV: 37.6 }, undefined, TS3), { deadbandResolver: resolver });
+    expect(c3).toHaveLength(1);
+    expect(cache.read('R1', 'TEMP_PV')!.value).toBe(37.6);
+  });
+
+  it('per-tag deadband_pct 触发 change (|Δ%| > pct)', () => {
+    // resolver 返 abs=0 pct=5 → 5% 阈值
+    const resolver: DeadbandResolver = () => ({ abs: 0, pct: 5 });
+    cache.write('R1', snap({ TEMP_PV: 100 }, undefined, TS1), { deadbandResolver: resolver });
+
+    // Δ=4 → Δ%=4 (< 5) → 不返 change
+    const c1 = cache.write('R1', snap({ TEMP_PV: 104 }, undefined, TS2), { deadbandResolver: resolver });
+    expect(c1).toHaveLength(0);
+    expect(cache.read('R1', 'TEMP_PV')!.value).toBe(100);
+
+    // Δ=6 → Δ%=6 (> 5) → 返 change
+    const c2 = cache.write('R1', snap({ TEMP_PV: 106 }, undefined, TS3), { deadbandResolver: resolver });
+    expect(c2).toHaveLength(1);
+    expect(cache.read('R1', 'TEMP_PV')!.value).toBe(106);
+  });
+
+  it('abs 和 pct 同时配 = OR (任一维度独立触发)', () => {
+    // resolver abs=0.5, pct=5 → 任一超就 change
+    const resolver: DeadbandResolver = () => ({ abs: 0.5, pct: 5 });
+
+    // Case A: prev=100, 走 abs 维度 (abs 先触发)
+    cache.write('R1', snap({ TAG_A: 100 }, undefined, TS1), { deadbandResolver: resolver });
+    // Δ=0.6 → abs 触发 (0.6 > 0.5); Δ%=0.6 < 5 pct 不触发; OR → change
+    const cA = cache.write('R1', snap({ TAG_A: 100.6 }, undefined, TS2), { deadbandResolver: resolver });
+    expect(cA).toHaveLength(1);
+    expect(cache.read('R1', 'TAG_A')!.value).toBe(100.6);
+
+    // Case B: prev=100, 走 pct 维度 (pct 先触发)
+    // 用新 reactor 隔离 state
+    cache.write('R2', snap({ TAG_B: 100 }, undefined, TS1), { deadbandResolver: resolver });
+    // Δ=6 → abs 触发 (6 > 0.5); 也 pct 触发 (6 > 5); 任一 OR → change
+    const cB = cache.write('R2', snap({ TAG_B: 106 }, undefined, TS2), { deadbandResolver: resolver });
+    expect(cB).toHaveLength(1);
+
+    // Case C: 两维度都不触发
+    cache.write('R3', snap({ TAG_C: 100 }, undefined, TS1), { deadbandResolver: resolver });
+    // Δ=0.3 → abs 0.3<=0.5 不触发; Δ%=0.3 < 5 不触发; → 不 change
+    const cC = cache.write('R3', snap({ TAG_C: 100.3 }, undefined, TS2), { deadbandResolver: resolver });
+    expect(cC).toHaveLength(0);
+    expect(cache.read('R3', 'TAG_C')!.value).toBe(100);
+  });
+
+  it('deadband resolver 返 undefined → fallback opts.deadband 全局', () => {
+    // resolver 全返 undefined → fallback opts.deadband=1.0
+    const resolver: DeadbandResolver = () => undefined;
+    cache.write('R1', snap({ TEMP_PV: 100 }, undefined, TS1), { deadband: 1.0, deadbandResolver: resolver });
+
+    // Δ=0.5 (≤ 1.0) → 不返 change
+    const c1 = cache.write('R1', snap({ TEMP_PV: 100.5 }, undefined, TS2), { deadband: 1.0, deadbandResolver: resolver });
+    expect(c1).toHaveLength(0);
+    expect(cache.read('R1', 'TEMP_PV')!.value).toBe(100);
+
+    // Δ=2.0 (> 1.0) → 返 change
+    const c2 = cache.write('R1', snap({ TEMP_PV: 102 }, undefined, TS3), { deadband: 1.0, deadbandResolver: resolver });
+    expect(c2).toHaveLength(1);
+    expect(cache.read('R1', 'TEMP_PV')!.value).toBe(102);
+  });
+
+  it('旧 opts.deadband 仍可用 (向后兼容 Phase 1, 不传 resolver)', () => {
+    // 完全不传 resolver, 仅 opts.deadband=0.3
+    cache.write('R1', snap({ TEMP_PV: 37.0 }, undefined, TS1), { deadband: 0.3 });
+
+    // Δ=0.3 (边界, ≤) → 不返 change (Phase 1 行为)
+    const c1 = cache.write('R1', snap({ TEMP_PV: 37.3 }, undefined, TS2), { deadband: 0.3 });
+    expect(c1).toHaveLength(0);
+    expect(cache.read('R1', 'TEMP_PV')!.value).toBe(37.0);
+
+    // Δ=0.4 (> 0.3) → 返 change
+    const c2 = cache.write('R1', snap({ TEMP_PV: 37.4 }, undefined, TS3), { deadband: 0.3 });
+    expect(c2).toHaveLength(1);
+    expect(cache.read('R1', 'TEMP_PV')!.value).toBe(37.4);
+  });
+
+  it('prev=0 时 deadband_pct 除零守卫 (Risk 2c)', () => {
+    // resolver 返 abs=0 pct=5 → 仅 pct 维度; prev=0 时 pct 不可用
+    const resolver: DeadbandResolver = () => ({ abs: 0, pct: 5 });
+    cache.write('R1', snap({ TAG_X: 0 }, undefined, TS1), { deadbandResolver: resolver });
+
+    // prev=0, 写 0.1: abs=0 关闭, pct 模式 prev=0 跳过 → 既不 NaN 也不 Infinity, 不返 change
+    const c1 = cache.write('R1', snap({ TAG_X: 0.1 }, undefined, TS2), { deadbandResolver: resolver });
+    expect(c1).toHaveLength(0);
+    expect(cache.read('R1', 'TAG_X')!.value).toBe(0);
+    // 验证 prev 守卫生效: value 没被覆盖, 也没崩
+    const entry = cache.read('R1', 'TAG_X')!;
+    expect(Number.isFinite(entry.value)).toBe(true);
+    expect(entry.lastChanged).toBe(TS1); // 未变
   });
 });

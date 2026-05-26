@@ -69,9 +69,52 @@ export interface SnapshotInput {
   quality: Record<string, 'good' | 'bad' | 'uncertain'>;
 }
 
+/**
+ * SP-PLC-3 P2.1 (2026-05-26): per-tag deadband 解析函数.
+ *
+ * 由调用方注入 (避免 tag-cache 直接 import plc-driver / sqlite-service 造成
+ * 循环依赖). 返 undefined 表示该 tag 无 per-tag 配置, 回退到全局 deadband.
+ *
+ * 实施 P2.2 时 caller 从 plc_variable_mappings.deadband_abs/_pct 字段读.
+ */
+export type DeadbandResolver = (
+  reactorId: string,
+  tag: string,
+) => { abs: number; pct: number } | undefined;
+
 export interface WriteOptions {
-  /** 绝对值 deadband, |new - prev| <= deadband 视为同值 (默认 0 即全推). */
+  /** 全局 deadband fallback (per-tag resolver 返 undefined 时用). 默认 0 即全推. */
   deadband?: number;
+  /** SP-PLC-3 P2.1: per-tag deadband 解析. 优先级高于 opts.deadband. */
+  deadbandResolver?: DeadbandResolver;
+}
+
+/**
+ * SP-PLC-3 P2.1: 同值判断 (per-tag 优先, fallback 全局).
+ *
+ * - perTag.abs > 0 或 perTag.pct > 0 任一非零 → per-tag 模式 (OR 关系):
+ *   - abs > 0 且 |Δ| > abs → 视为变化
+ *   - pct > 0 且 |prev| > 0 且 |Δ|/|prev|*100 > pct → 视为变化
+ *   - prev=0 时除零守卫: 仅看 abs 维度 (pct 不可用)
+ * - perTag undefined 或全 0 → fallback 全局 deadband
+ *
+ * 边界: |Δ| == abs (或 Δ% == pct) 视为同值, 与 Phase 1 全局 deadband
+ * "<= deadband 视为同值" 语义一致.
+ */
+function isChange(
+  prev: number,
+  curr: number,
+  perTag: { abs: number; pct: number } | undefined,
+  globalDeadband: number,
+): boolean {
+  if (perTag && (perTag.abs > 0 || perTag.pct > 0)) {
+    if (perTag.abs > 0 && Math.abs(curr - prev) > perTag.abs) return true;
+    if (perTag.pct > 0 && Math.abs(prev) > 0) {
+      if ((Math.abs(curr - prev) / Math.abs(prev)) * 100 > perTag.pct) return true;
+    }
+    return false;
+  }
+  return Math.abs(curr - prev) > globalDeadband;
 }
 
 /**
@@ -100,6 +143,7 @@ export class TagCache {
    */
   write(reactorId: string, snapshot: SnapshotInput, opts?: WriteOptions): CacheChange[] {
     const deadband = opts?.deadband ?? 0;
+    const resolver = opts?.deadbandResolver;
     let reactorMap = this.store.get(reactorId);
     if (!reactorMap) {
       reactorMap = new Map();
@@ -142,8 +186,9 @@ export class TagCache {
         continue;
       }
 
-      const delta = Math.abs(newValue - existing.value);
-      const sameValue = delta <= deadband;
+      // SP-PLC-3 P2.1: per-tag deadband 优先, fallback opts.deadband (Phase 1).
+      const perTag = resolver?.(reactorId, tag);
+      const sameValue = !isChange(existing.value, newValue, perTag, deadband);
 
       if (sameValue) {
         // 同值: ts/prevValue 更新便于 deadband 链路, lastChanged 不动, 不 fan-out.
