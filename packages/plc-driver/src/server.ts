@@ -174,10 +174,18 @@ app.post('/api/plc/import/csv', (req, res) => {
   res.json({ imported, errors });
 });
 
-// --- PLC 连接状态 ---
+// --- PLC 连接状态 (DEPRECATED) ---
+// 此 standalone plc-driver server 未在生产部署: docker-compose 不启动,
+// 0 caller 引用 :3002, 实际 PLC 状态查询走主 server (packages/server) 的
+// plc-bridge.ts + scada-write-dispatcher.ts. endpoint 保留为 fixture stub,
+// 不实现 PLCConnectionManager 状态聚合 (本可加 module-scoped Map + 在
+// /test endpoint 维护, 但无消费者, 收益为零).
 app.get('/api/plc/status', (_req, res) => {
-  // TODO: 从活跃的PLCConnectionManager实例获取状态
-  res.json({ connections: [] });
+  res.json({
+    connections: [],
+    deprecated: true,
+    note: 'standalone plc-driver not in production; PLC status lives in main server',
+  });
 });
 
 // ─── REST API: 批次管理 ────────────────────────────────────
