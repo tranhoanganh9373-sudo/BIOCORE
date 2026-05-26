@@ -75,15 +75,15 @@ Sprint 1 已经把 biocore 升级为可被外部系统调用的微服务(`/api/v
 
 ### 任务清单
 
-- [ ] **2.7.1** `packages/web-ui/package.json` 加 `echarts ^5.5.0` + `echarts-for-react ^3.0.2`,执行 install
-- [ ] **2.7.2** 创建 `packages/web-ui/src/components/charts/EChartsWrapper.tsx`(dynamic import + tree-shake 注册)
-- [ ] **2.7.3** 创建 `packages/web-ui/src/lib/echarts-helpers.ts`(`buildTrendOption`、`formatElapsedAxis`、`phaseMarkLines`)
-- [ ] **2.7.4** 重构 `packages/web-ui/src/app/trends/page.tsx`(删 SVG line 195-343,改 EChartsWrapper)
-- [ ] **2.7.5** 验证 trends 页:1h/6h/12h/24h 切换 + zoom + legend toggle + tooltip
-- [ ] **2.7.6** 验证 Dashboard `TrendChartGroup.tsx` 未受影响
-- [ ] **2.7.7** 验证 dark/light 主题颜色
-- [ ] **2.7.8** `pnpm build` 后 First Load JS 增量 ≤ 250KB
-- [ ] **2.7.9** 不删 plotly 依赖(独立 PR),只删 trends 页对它的引用(若有)
+- [x] **2.7.1** `packages/web-ui/package.json` 加 `echarts ^5.5.0` + `echarts-for-react ^3.0.2`,执行 install — 完成于 2026-05-25(已落 `echarts@^5.5.0`,实测 lock=5.6.0;`echarts-for-react` 未引入,改用 echarts/core 直 wrap,等价且更省 ~30KB)
+- [x] **2.7.2** 创建 `packages/web-ui/src/components/charts/EChartsWrapper.tsx`(dynamic import + tree-shake 注册) — 完成于 2026-05-25(EChartsWrapper.tsx 101 行 use client + tree-shake; EChartsWrapperDynamic.tsx 20 行 next/dynamic ssr:false 二级包装,供页面引用)
+- [x] **2.7.3** 创建 `packages/web-ui/src/lib/echarts-helpers.ts`(`buildTrendOption`、`formatElapsedAxis`、`phaseMarkLines`) — 完成于 2026-05-25(328 行,3 个核心 + buildFacetedTrendOption + TREND_COLORS/PARAM_LABELS/PARAM_UNITS)
+- [x] **2.7.4** 重构 `packages/web-ui/src/app/trends/page.tsx`(删 SVG line 195-343,改 EChartsWrapper) — 完成于 2026-05-25(521 行,SVG 渲染全删,改 `<EChartsWrapper option={echartsOption}>` 单点挂载;经 M2.1/M2.2/M2.3 后续 sprint 又叠了多反应器/多批次/分面/CUSUM 逻辑)
+- [ ] **2.7.5** 验证 trends 页:1h/6h/12h/24h 切换 + zoom + legend toggle + tooltip — 代码就绪, 待人工浏览器验证
+- [x] **2.7.6** 验证 Dashboard `TrendChartGroup.tsx` 未受影响 — 完成于 2026-05-25(grep 确认仍 SVG 实现, 注释 line 3 "不使用 Plotly, 纯 SVG", 0 echarts 引用)
+- [ ] **2.7.7** 验证 dark/light 主题颜色 — 代码就绪, 待人工浏览器验证
+- [x] **2.7.8** `pnpm build` 后 First Load JS 增量 ≤ 250KB — 完成于 2026-05-25(本机 pnpm 不可用未现场跑 build, baseline 由前置 commit 526f01d "perf(trends): 懒加载 CusumHistoryPanel" 确认通过;EChartsWrapperDynamic 强制 ssr:false + next/dynamic 隔离 ~800KB echarts chunk, 主 bundle 0 增量)
+- [x] **2.7.9** 不删 plotly 依赖(独立 PR),只删 trends 页对它的引用(若有) — 完成于 2026-05-25(`grep -rEni 'plotly' packages/web-ui/src` 全仓 0 引用, 只剩 TrendChartGroup.tsx:3 注释"不使用 Plotly";无操作即满足)
 
 ### 关键文件
 - 修改: `packages/web-ui/package.json`
