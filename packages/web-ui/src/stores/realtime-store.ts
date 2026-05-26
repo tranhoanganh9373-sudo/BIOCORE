@@ -272,7 +272,7 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
             | Record<string, TagQuality>
             | undefined;
 
-          // legacy 顶层 push (单反应器组件 + 测试仍用)
+          // legacy 顶层 push (单反应器组件 + 测试仍用) — push 进 ring, 写入推迟到下方单 set
           const topBuf = get().trendBuffer;
           topBuf.timestamps.push(msg.timestamp);
           topBuf.temperature.push(msg.payload['AI-0'] ?? 0);
@@ -280,16 +280,15 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
           topBuf.DO.push(msg.payload['AI-3'] ?? 0);
           topBuf.rpm.push(msg.payload.rpm ?? 0);
           topBuf.airflow.push(msg.payload['AI-5'] ?? 0);
-          // wrapper clone (RingBuffer 实例引用不变, 仅 object 身份变 → selector re-run)
-          set({ processValues: pv, trendBuffer: { ...topBuf } });
 
-          // 反应器隔离写入 (含 qualityMap)
+          // 反应器隔离 push (含 qualityMap) — push 进 ring, 写入推迟到下方单 set
           const rid = msg.reactor_id;
+          let reactorBuf: TrendBuffer | undefined;
           if (rid) {
             const prevReactor = get().reactorData[rid];
             // 首次写入 (reactorData[rid] 未建) 或 sentinel fallback 命中: alloc fresh
             // trendBuffer 避免 cross-reactor 共享 EMPTY_REACTOR_DATA.trendBuffer 引用.
-            const reactorBuf: TrendBuffer =
+            reactorBuf =
               prevReactor && prevReactor.trendBuffer !== EMPTY_REACTOR_DATA.trendBuffer
                 ? prevReactor.trendBuffer
                 : createTrendBuffer();
@@ -299,14 +298,31 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
             reactorBuf.DO.push(msg.payload['AI-3'] ?? 0);
             reactorBuf.rpm.push(msg.payload.rpm ?? 0);
             reactorBuf.airflow.push(msg.payload['AI-5'] ?? 0);
-            updateReactor(rid, {
-              processValues: pv,
-              qualityMap,
-              // wrapper clone — RingBuffer 实例引用不变, 但 trendBuffer object 身份变
-              // 让 `s.reactorData[rid]?.trendBuffer` 订阅 hook (useTagHistory) re-run.
-              trendBuffer: { ...reactorBuf },
-            });
           }
+
+          // SP-PLC-3 Patch C (2026-05-26): 单 set() 同时写双路 (legacy 顶层 +
+          // reactor 隔离), Zustand 通知 / selector check 从 5Hz × 2 → 5Hz × 1.
+          // wrapper clone: RingBuffer 实例引用不变, 但 trendBuffer object 身份变
+          // 让 selector re-run.
+          set((s) => {
+            const next: Partial<RealtimeState> = {
+              processValues: pv,
+              trendBuffer: { ...topBuf },
+            };
+            if (rid && reactorBuf) {
+              const prev = s.reactorData[rid] || EMPTY_REACTOR_DATA;
+              next.reactorData = {
+                ...s.reactorData,
+                [rid]: {
+                  ...prev,
+                  processValues: pv,
+                  qualityMap,
+                  trendBuffer: { ...reactorBuf },
+                },
+              };
+            }
+            return next;
+          });
           break;
         }
 
