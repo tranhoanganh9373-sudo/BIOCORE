@@ -33,9 +33,17 @@ export interface PlcConfigAuditEntry {
   ip_address?: string;
 }
 
-/** scheduler 接口的最小子集 (避免 import 整个 plc-driver 主 entry, 见 index.ts:3262 注) */
+/**
+ * scheduler 接口的最小子集 (避免 import 整个 plc-driver 主 entry, 见 index.ts:3262 注).
+ * SP-PLC-3 P3a.3: 由 restart-only 改为 addVariable/removeVariable 增量 API.
+ * PUT handler 走 remove + add (upsert 语义), 不重启 timer, 避免 P2.4
+ * scheduler.restart 触发的 1×poll_rate 空窗 (plan §1 Commit 3 + Risk 2b).
+ * restart() 仍保留 (向后兼容 / 紧急回退路径), 但本路由不再调.
+ */
 export interface SchedulerRestartable {
   restart(): void;
+  addVariable(v: PLCVariableMapping): void;
+  removeVariable(id: string): void;
 }
 
 export interface PlcConfigDeps {
@@ -94,7 +102,10 @@ export function registerPlcConfigRoutes(apiRouter: Router, deps: PlcConfigDeps):
       return;
     }
 
-    // poll_rate_ms 变化时热重启对应 reactor 的 scheduler
+    // poll_rate_ms 变化时让对应 reactor 的 scheduler 热生效.
+    // SP-PLC-3 P3a.3: 走 remove + add 增量 (upsert 语义), 不重启 timer,
+    // 避免 P2.4 scheduler.restart 触发的 1×poll_rate PLC 空窗.
+    // (字段名 restartedReactors 保留向后兼容 API; 实际语义 = "变更生效的 reactor id".)
     const pollChanged =
       body.poll_rate_ms !== undefined && body.poll_rate_ms !== existing.poll_rate_ms;
     const restartedReactors: string[] = [];
@@ -102,10 +113,11 @@ export function registerPlcConfigRoutes(apiRouter: Router, deps: PlcConfigDeps):
       const reactorIds = deps.getReactorIdsByPlcId(existing.connection_id);
       for (const reactorId of reactorIds) {
         const scheduler = deps.pollingSchedulers.get(reactorId);
-        if (scheduler) {
-          scheduler.restart();
-          restartedReactors.push(reactorId);
-        }
+        if (!scheduler) continue;
+        // 先删旧 (按 id), 再加新 (含新 poll_rate_ms) → 下次 tick regroup, 无空窗
+        scheduler.removeVariable(id);
+        scheduler.addVariable(merged);
+        restartedReactors.push(reactorId);
       }
     }
 

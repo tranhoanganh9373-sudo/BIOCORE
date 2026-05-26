@@ -560,39 +560,102 @@ export class PollingScheduler extends EventEmitter {
   private mgr: PLCConnectionManager;
   private timers: Map<number, ReturnType<typeof setInterval>> = new Map();
   private running = false;
+  // SP-PLC-3 P3a.3: 内部 vars 维护 + 增量 add/remove API.
+  // - null = 尚未初始化, start() 时 lazy snapshot from mgr.getVariableList()
+  //   (保持 P2 caller 兼容: index.ts:3754 仍是 mgr.setVariables 全量模式).
+  // - 非 null = 用 instance vars 当事实源, add/remove/setVariables 修改它.
+  // 任一 mutator 调用都置 _dirty=true, 下次 tick 内 regroupByRate 重 group;
+  // 不停现有 timer (避免 P2.4 restart 的 1×poll_rate 空窗).
+  private vars: PLCVariableMapping[] | null = null;
+  private groupedByRate: Map<number, PLCVariableMapping[]> = new Map();
+  private _dirty = false;
 
   constructor(mgr: PLCConnectionManager) {
     super();
     this.mgr = mgr;
   }
 
+  /** SP-PLC-3 P3a.3: 显式覆盖 instance vars (snapshot 全量). 切到 instance 模式. */
+  setVariables(vars: PLCVariableMapping[]): void {
+    this.vars = [...vars];
+    this._dirty = true;
+  }
+
+  /** SP-PLC-3 P3a.3: 增量加单 variable, 下次 tick 自动包含 (不重启 timer). */
+  addVariable(v: PLCVariableMapping): void {
+    if (this.vars === null) {
+      // lazy 初始化: 先 snapshot mgr 当前 vars (保持已存在变量), 再 push 新值
+      this.vars = [...this.mgr.getVariableList()];
+    }
+    this.vars.push(v);
+    this._dirty = true;
+  }
+
+  /** SP-PLC-3 P3a.3: 增量删 variable (按 id), 下次 tick 自动跳过 (不重启 timer). */
+  removeVariable(id: string): void {
+    if (this.vars === null) {
+      this.vars = [...this.mgr.getVariableList()];
+    }
+    this.vars = this.vars.filter((v) => v.id !== id);
+    this._dirty = true;
+  }
+
+  /** 当前生效的 vars (优先 instance, 否则 mgr). 仅 readable + enabled. */
+  private getEffectiveVars(): PLCVariableMapping[] {
+    const src = this.vars ?? this.mgr.getVariableList();
+    return src.filter((v) => v.direction !== 'WRITE' && v.enabled);
+  }
+
+  /** 按 rate 重 group (instance state). dirty flag 清零. 新 rate 启 timer. */
+  private regroupByRate(): void {
+    const next = new Map<number, PLCVariableMapping[]>();
+    for (const v of this.getEffectiveVars()) {
+      const rate = v.poll_rate_ms || 1000;
+      if (!next.has(rate)) next.set(rate, []);
+      next.get(rate)!.push(v);
+    }
+    this.groupedByRate = next;
+    this._dirty = false;
+    // 新出现的 rate 需补 timer (不停现有 timer; 老 rate 留空 timer 无害,
+    // tick 内 if (vars.length === 0) return 跳过 emit).
+    if (this.running) {
+      for (const rate of next.keys()) {
+        if (!this.timers.has(rate)) {
+          this.startTimerForRate(rate);
+        }
+      }
+    }
+  }
+
+  /** 启动单个 rate 的 setInterval timer; 闭包仅捕获 rate, vars 每 tick 从 groupedByRate 读最新. */
+  private startTimerForRate(rateMs: number): void {
+    const timer = setInterval(async () => {
+      if (!this.running) return;
+      // dirty 优先 regroup (下次 tick 时机即生效, 不停现有 timer)
+      if (this._dirty) this.regroupByRate();
+      const vars = this.groupedByRate.get(rateMs);
+      if (!vars || vars.length === 0) return; // 空 rate 跳过 emit (e.g. 全删后空闲)
+      try {
+        const snapshot = await this.pollGroup(vars);
+        this.emit('snapshot', snapshot);
+      } catch (err) {
+        this.emit('error', err);
+      }
+    }, rateMs);
+    this.timers.set(rateMs, timer);
+  }
+
   start(): void {
     if (this.running) return;
     this.running = true;
 
-    // 按 poll_rate_ms 分组
-    const groups = new Map<number, PLCVariableMapping[]>();
-    for (const v of this.mgr.getVariableList()) {
-      if (v.direction === 'WRITE' || !v.enabled) continue;
-      const rate = v.poll_rate_ms || 1000;
-      if (!groups.has(rate)) groups.set(rate, []);
-      groups.get(rate)!.push(v);
+    // 初始 group + 启每 rate 一 timer (闭包仅捕 rate, vars 从 groupedByRate 实时读)
+    this.regroupByRate();
+    for (const rate of this.groupedByRate.keys()) {
+      this.startTimerForRate(rate);
     }
 
-    for (const [rateMs, vars] of groups) {
-      const timer = setInterval(async () => {
-        if (!this.running) return;
-        try {
-          const snapshot = await this.pollGroup(vars);
-          this.emit('snapshot', snapshot);
-        } catch (err) {
-          this.emit('error', err);
-        }
-      }, rateMs);
-      this.timers.set(rateMs, timer);
-    }
-
-    this.emit('started', { groupCount: groups.size });
+    this.emit('started', { groupCount: this.groupedByRate.size });
   }
 
   stop(): void {
@@ -605,6 +668,8 @@ export class PollingScheduler extends EventEmitter {
   }
 
   // H-3: Restart polling after variable list changes
+  // SP-PLC-3 P3a.3: 仍保留 restart() (向后兼容 + 紧急回退路径), 但 plc-config-routes
+  // 默认走 remove+add 增量路径避免 1×poll_rate 空窗.
   restart(): void {
     this.stop();
     this.start();
