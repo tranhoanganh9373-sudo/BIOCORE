@@ -3279,6 +3279,52 @@ const {
   pollingSchedulers,
 });
 
+// ─── SP-PLC-3 P3: broadcaster + flusher (plan §1 Commit 3) ─────────
+// 解耦了 reactor-wiring 闭包里的 inline pv_realtime broadcast 和 inline
+// InfluxDB Point 写入. 现在:
+//   - broadcaster: 订阅 tagCache 变化 → 200ms dirty-only fan-out
+//     (前端兼容: 23 个 PV 字段 + 新增 quality 字段)
+//   - flusher:     1Hz 周期遍历 reactor → 写 process_data Point
+//     (9 字段, quality='bad' skip)
+// 旧 reactor-wiring collector tick (60s) 仍跑, 但 tick 内只写 cache + CUSUM,
+// 不再做 broadcast / Influx 写; 等价于把"高频读 + 低频写"重排成
+// "高频读 + 高频 cache + 1Hz Influx + 5Hz dirty WS".
+import { startRealtimeBroadcaster } from './engine/realtime-broadcaster';
+import { startInfluxFlusher } from './engine/influx-flusher';
+
+const stopBroadcaster = startRealtimeBroadcaster({
+  tagCache,
+  broadcast,
+  wss,
+  // 与旧 reactor-wiring `batchId === 'idle' ? null : batchId` 等价: 仅在
+  // 批次真 running 时返 real batch_id, 否则 null.
+  getBatchId: (reactorId) => {
+    const ctrl = reactorManager.getReactor(reactorId);
+    if (!ctrl) return null;
+    return ctrl.currentState === 'running' && ctrl.currentBatchId
+      ? ctrl.currentBatchId
+      : null;
+  },
+});
+
+const stopFlusher = startInfluxFlusher({
+  tagCache,
+  influxWriteApi,
+  reactorIds: () => reactorManager.listReactors().map((r) => r.id),
+  // Influx tag 不接受 null: 与旧 reactor-wiring `tag('batch_id', String(batchId))`
+  // 等价, 闲置/无 ctrl 时落 'idle' 字符串.
+  getBatchId: (reactorId) => {
+    const ctrl = reactorManager.getReactor(reactorId);
+    if (!ctrl) return 'idle';
+    return ctrl.currentState === 'running' && ctrl.currentBatchId
+      ? ctrl.currentBatchId
+      : 'idle';
+  },
+});
+
+process.on('SIGTERM', () => { stopBroadcaster(); stopFlusher(); });
+process.on('SIGINT', () => { stopBroadcaster(); stopFlusher(); });
+
 // route-handler-split (post v1.12.0): single buildReactorConfig factory
 // shared by /reactors POST, /reactors/:id/download-recipe, and the
 // runOrphanRecoveryScan hook in startup.ts. Previously the same config

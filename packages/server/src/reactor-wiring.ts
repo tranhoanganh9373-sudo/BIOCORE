@@ -24,7 +24,11 @@
 // ============================================================
 
 import type Database from 'better-sqlite3';
-import { Point } from '@influxdata/influxdb-client';
+// SP-PLC-3 P3 (plan §1 Commit 3): Point 已不再在本模块用 (写入移到
+// engine/influx-flusher.ts). WriteApi 类型仍出现在 ReactorWiringDeps
+// 上, 保留 — 主调用方 (index.ts) 仍需向 influxWriteApi 注入实例供
+// startInfluxFlusher 使用; 同时 collector 的 `if (!influxWriteApi) return`
+// guard 沿用旧 "无 Influx 不启动 collector" 行为.
 import type { WriteApi } from '@influxdata/influxdb-client';
 import { getAuditQueue } from './audit-queue';
 
@@ -170,51 +174,10 @@ export function createReactorWiring(deps: ReactorWiringDeps): ReactorWiringHandl
         }
         const rpmRaw = rawPV['VFD_ACTUAL_FREQ'] * 24;
 
-        const point = new Point('process_data')
-          .tag('reactor_id', reactorId)
-          .tag('batch_id', String(batchId))
-          .floatField('temperature', rawPV['TEMP_PV'])
-          .floatField('jacket_temp', rawPV['JACKET_PV'])
-          .floatField('pH', rawPV['PH_PV'])
-          .floatField('DO', rawPV['DO_PV'])
-          .floatField('pressure', rawPV['PRESSURE_PV'])
-          .floatField('airflow', rawPV['AIRFLOW_PV'])
-          .floatField('weight', rawPV['WEIGHT_PV'])
-          .floatField('rpm', rpmRaw)
-          .floatField('vfd_current', rawPV['VFD_CURRENT'])
-          .timestamp(new Date());
-        influxWriteApi!.writePoint(point);
-        // 异步 flush, 不阻塞下一次采样
-        influxWriteApi!.flush().catch((e: any) =>
-          console.error(`[${new Date().toISOString()}] [ERROR] [Influx flush] ${e?.message || e}`)
-        );
-
-        // ─── 广播实时 PV 到前端 ──────────────────────────
-        const pvPayload = {
-          timestamp: new Date().toISOString(),
-          batch_id: batchId === 'idle' ? null : batchId,
-          'AI-0': rawPV['TEMP_PV'],      // 罐温
-          'AI-1': rawPV['JACKET_PV'],     // 夹套温度
-          'AI-2': rawPV['PH_PV'],         // pH
-          'AI-3': rawPV['DO_PV'],         // DO
-          'AI-4': rawPV['PRESSURE_PV'],   // 罐压
-          'AI-5': rawPV['AIRFLOW_PV'],    // 空气流量
-          'AI-6': rawPV['WEIGHT_PV'],     // 称重
-          rpm: Math.round(rpmRaw),
-          vfd_current: rawPV['VFD_CURRENT'],
-          'AO-0_cv': rawPV['STEAM_CV'],   // 蒸汽阀
-          'AO-1_cv': rawPV['COOL_CV'],    // 冷却阀
-          'AO-2_cv': rawPV['AIR_CV'],     // 空气阀
-          P01_rate: rawPV['P01_RATE'],     // 碱泵
-          P02_rate: rawPV['P02_RATE'],     // 补料泵
-          P03_rate: rawPV['P03_RATE'],     // 氮源泵
-          P04_rate: rawPV['P04_RATE'],     // 酸泵
-          temp_mode: 2,                     // 冷却模式
-          temp_sv: rawPV['TEMP_SV'],
-          pH_sv: rawPV['PH_SV'],
-          DO_sv: rawPV['DO_SV'],
-        };
-        broadcast('pv_realtime', pvPayload, batchId === 'idle' ? null : batchId, reactorId);
+        // SP-PLC-3 P3 (plan §1 Commit 3): 已拆出
+        //   - InfluxDB Point 写入   → startInfluxFlusher (engine/influx-flusher.ts, 1Hz)
+        //   - WS pv_realtime 推送  → startRealtimeBroadcaster (engine/realtime-broadcaster.ts, 5Hz dirty-only)
+        // 本 collector 仅保留 cache 写入 + CUSUM/软测量/告警等闭包依赖路径.
 
         // ─── CUSUM 实时异常检测 ───────────────────────────
         if (batchId !== 'idle') {
