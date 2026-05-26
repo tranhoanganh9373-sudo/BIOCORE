@@ -78,6 +78,42 @@ export function registerRecipeRoutes(
     res.json(sqlite.listPendingReview());
   });
 
+  /**
+   * @openapi
+   * /recipes:
+   *   get:
+   *     summary: 列出配方 (M5 spec 5.10)
+   *     tags: [Recipes]
+   *     parameters:
+   *       - in: query
+   *         name: status
+   *         schema: { type: string, enum: [draft, pending_approval, approved, pending_deprecation, deprecated] }
+   *         description: 按 status 精确过滤; 留空 = 所有 status
+   *       - in: query
+   *         name: is_template
+   *         schema: { type: string, enum: ['true', '1', 'all'] }
+   *         description: |
+   *           M3.3 模板过滤:
+   *           - 缺省 → 只返回非模板配方
+   *           - `true` / `1` → 只返回模板
+   *           - `all` → 全部 (含模板和配方)
+   *     responses:
+   *       200:
+   *         description: 配方列表 (按建库顺序)
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: array
+   *               items:
+   *                 type: object
+   *                 properties:
+   *                   recipe_id: { type: string }
+   *                   version: { type: string }
+   *                   status: { type: string }
+   *                   is_template: { type: boolean }
+   *                   created_at: { type: string, format: date-time }
+   *                   metadata: { type: object }
+   */
   apiRouter.get('/recipes', (req, res) => {
     const status = req.query.status as string | undefined;
     // M3.3: is_template 过滤

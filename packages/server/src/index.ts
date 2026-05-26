@@ -518,11 +518,19 @@ export { hashPasswordBcrypt, verifyPassword };
 
 // ─── Express ───────────────────────────────────────────────
 // v1.9.0 P2 bucket 1.7: express app + middleware + apiRouter + swagger
-// constructed in ./bootstrap. We pass __filename so swagger-jsdoc still
-// scans this file's @openapi blocks; ALLOWED_ORIGINS / dev fallback /
-// prod fail-fast all live in resolveAllowedOrigins() inside bootstrap.
+// constructed in ./bootstrap. We pass __filename + glob of *-routes.ts so
+// swagger-jsdoc scans this file AND每个抽离后的子路由文件的 @openapi 注解
+// (M5 Sprint 1 复盘: 子文件抽离后 spec 还在 single-file 时代, 8 个端点
+// 的 JSDoc 注解曾被静默丢弃, 仅扫到 index.ts 残留的 /trends + /alarms +
+// /batches/{id}/samples 三块; 修复后所有 *-routes.ts 注解都生效).
+// ALLOWED_ORIGINS / dev fallback / prod fail-fast all live in
+// resolveAllowedOrigins() inside bootstrap.
 const { app, apiRouter, authEnabled: AUTH_ENABLED } = createApp({
-  swaggerScanPath: __filename,
+  swaggerScanPath: [
+    __filename,
+    pathResolve(__dirname, '*-routes.ts'),
+    pathResolve(__dirname, '*-routes.js'), // 编译产物 (运行时 dist/ 兜底)
+  ],
   apiV0Sunset: API_V0_SUNSET,
 });
 

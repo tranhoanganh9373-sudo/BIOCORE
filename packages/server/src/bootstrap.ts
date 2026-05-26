@@ -33,8 +33,14 @@ export interface BootstrapHandles {
 }
 
 export interface BootstrapOptions {
-  /** absolute file path the swagger-jsdoc parser should scan for @openapi blocks */
-  swaggerScanPath: string;
+  /**
+   * 文件路径 (或 glob) 列表, swagger-jsdoc 用来扫描 `@openapi` JSDoc 注解.
+   * 历史上仅传单个 `index.ts` (`apis: [__filename]`); v1.9.0 P2 把路由抽到
+   * `*-routes.ts` 子文件后, 必须传 glob 数组 (如
+   * `[__filename, path.resolve(__dirname, '*-routes.ts')]`) 否则子文件里的
+   * `@openapi` 注解会被静默丢弃 — 这是 M5 Sprint 1 复盘发现的偏离 spec 的 bug.
+   */
+  swaggerScanPath: string | string[];
   /** v0 sunset date string used in /docs description and the deprecation header */
   apiV0Sunset: string;
 }
@@ -112,7 +118,7 @@ export function createApp(opts: BootstrapOptions): BootstrapHandles {
       },
       security: [{ Bearer: [] }, { ApiKey: [] }],
     },
-    apis: [swaggerScanPath],
+    apis: Array.isArray(swaggerScanPath) ? swaggerScanPath : [swaggerScanPath],
   });
 
   // /docs 公开 (无需鉴权), 已在 PUBLIC_PATHS 中

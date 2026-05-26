@@ -31,7 +31,7 @@ biocore 已确定独立产品定位:**实验室发酵罐控制 + 时序数据采
 | M2 — Express Router + /api/v1 双挂载 | ✅ 完成 | 8/8 | 实际 ~1h |
 | M3 — trace_id + 统一响应格式 | ✅ 完成 | 6/6 | 实际 ~30min |
 | M4 — API Key 认证 | ✅ 完成 | 12/12 | 实际 ~1.5h |
-| M5 — Swagger 文档自动生成 | ✅ 完成 | 11/11 | 实际 ~45min |
+| M5 — Swagger 文档自动生成 | ✅ 代码就绪 | 10/11 (5.11 待人工浏览器验证) | 实际 ~45min |
 | M6 — WebSocket 鉴权 + 协议文档 | ✅ 完成 | 7/7 | 实际 ~30min |
 | M7 — MOCK_PLC 环境变量化 | ✅ 完成 | 4/4 | 实际 ~15min |
 | M8 — 集成验证 + 文档 | ✅ 完成 | 9/9 | 实际 ~30min |
@@ -209,21 +209,24 @@ biocore 已确定独立产品定位:**实验室发酵罐控制 + 时序数据采
 - Sprint 1 只为 8 个核心端点写注解(framework 就位即可,后续按需补)
 
 ### 任务清单
-- [ ] **5.1** `packages/server/package.json` 加依赖: `swagger-jsdoc`、`swagger-ui-express`、`@types/swagger-jsdoc`、`@types/swagger-ui-express`,执行 install
-- [ ] **5.2** `packages/server/src/index.ts` 引入 + 配置 swaggerJsdoc(扫描 `./src/index.ts`),定义 `securitySchemes` 含 `ApiKey` 和 `Bearer`
-- [ ] **5.3** 挂载 `apiRouter.get('/docs.json', ...)` 返回 spec
-- [ ] **5.4** 挂载 `apiRouter.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec))`
-- [ ] **5.5** PUBLIC_PATHS 加入 `/docs`、`/docs.json`(供未鉴权访问)
-- [ ] **5.6** 写 `POST /auth/login` 的 JSDoc 注解
-- [ ] **5.7** 写 `GET /reactors` 的 JSDoc 注解
-- [ ] **5.8** 写 `GET /reactors/:id/status` 的 JSDoc 注解
-- [ ] **5.9** 写 `POST /reactors/:id/download-recipe` 的 JSDoc 注解
-- [ ] **5.10** 写 `GET /recipes`、`GET /batches`、`GET /trends`、`GET /alarms` 的 JSDoc 注解
-- [ ] **5.11** 验证: 浏览器访问 `http://localhost:3001/api/v1/docs/` 显示 Swagger UI,8 个端点可看到详情;`curl http://localhost:3001/api/v1/docs.json | jq '.openapi'` 返回 `"3.0.0"`
+- [x] **5.1** `packages/server/package.json` 加依赖: `swagger-jsdoc`、`swagger-ui-express`、`@types/swagger-jsdoc`、`@types/swagger-ui-express`,执行 install — 完成 (早期 sprint 已 install, `node_modules` 内 4 个 pkg 全部齐备)
+- [x] **5.2** `packages/server/src/index.ts` 引入 + 配置 swaggerJsdoc,定义 `securitySchemes` 含 `ApiKey` 和 `Bearer` — 完成 (v1.9.0 P2 重构后 swagger 配置抽到 `bootstrap.ts:84-116`; `securitySchemes.ApiKey`(`X-API-Key`) + `securitySchemes.Bearer`(`JWT`) + 全局 `security` + `components.schemas.UnifiedResponse` 都齐); **2026-05-25 修订**: spec 5.2 原话"扫描 ./src/index.ts" — 子文件抽离后 `apis: [__filename]` 漏扫所有 `*-routes.ts`, 仅收 3 端点; 改为 `apis: [__filename, *-routes.ts, *-routes.js]` glob 后 19 个端点正常收录
+- [x] **5.3** 挂载 `apiRouter.get('/docs.json', ...)` 返回 spec — 完成 (`bootstrap.ts:119`)
+- [x] **5.4** 挂载 `apiRouter.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec))` — 完成 (`bootstrap.ts:120-122`, 加 `customSiteTitle: 'BIOCore API Docs'`)
+- [x] **5.5** PUBLIC_PATHS 加入 `/docs`、`/docs.json`(供未鉴权访问) — 完成 (`middlewares/auth.ts:21` PUBLIC_PATHS 含 `/docs.json`; `:24` DOCS_PUBLIC_PREFIXES=`['/docs']` 兜底 swagger-ui-express 子路径 `/docs/swagger-ui.css` 等; 双层判断在 `:91, :95`)
+- [x] **5.6** 写 `POST /auth/login` 的 JSDoc 注解 — 完成 (`auth-routes.ts:51-90`)
+- [x] **5.7** 写 `GET /reactors` 的 JSDoc 注解 — 完成 (`reactor-routes.ts:71-95`)
+- [x] **5.8** 写 `GET /reactors/:id/status` 的 JSDoc 注解 — 完成 (`reactor-routes.ts:101-140`)
+- [x] **5.9** 写 `POST /reactors/:id/download-recipe` 的 JSDoc 注解 — 完成 (`reactor-routes.ts:218-262`)
+- [x] **5.10** 写 `GET /recipes`、`GET /batches`、`GET /trends`、`GET /alarms` 的 JSDoc 注解 — 完成 于 2026-05-25 (`/batches` = `batch-routes.ts:27`; `/trends` = `index.ts:3315`; `/alarms` = `index.ts:2247`; **`/recipes` GET list 此前完全缺失 JSDoc, 本次补到 `recipe-routes.ts:81-114`**)
+- [ ] **5.11** 验证: 浏览器访问 `http://localhost:3001/api/v1/docs/` 显示 Swagger UI,8 个端点可看到详情;`curl http://localhost:3001/api/v1/docs.json | jq '.openapi'` 返回 `"3.0.0"` — 代码就绪, 待人工启 server + 浏览器验证 (subagent 本地直接调 `swagger-jsdoc` 生成 spec 验证: 8/8 必需端点全部收录 + `openapi='3.0.0'` + `securitySchemes.ApiKey`+`.Bearer` 双重均在, 但**未启 server, 未跑浏览器**)
 
 **关键文件路径:**
-- 修改: `packages/server/package.json`
-- 修改: `packages/server/src/index.ts`(swagger 配置 + 8 处 JSDoc 注解)
+- 修改: `packages/server/package.json` (依赖早期 sprint 已加)
+- 修改: `packages/server/src/index.ts` (2026-05-25: `swaggerScanPath` 改 glob 数组扫所有 `*-routes.ts`; `/trends`+`/alarms` JSDoc 早期已写)
+- 修改: `packages/server/src/bootstrap.ts` (2026-05-25: `BootstrapOptions.swaggerScanPath` 类型扩 `string | string[]`; `apis` 数组 normalize)
+- 修改: `packages/server/src/recipe-routes.ts` (2026-05-25: 补 `GET /recipes` 缺失的 JSDoc 注解)
+- 现状: `auth-routes.ts` `reactor-routes.ts` `recipe-routes.ts` `batch-routes.ts` `metrics-routes.ts` `index.ts` 共 6 个文件内的 `@openapi` 注解都被 swagger-jsdoc 扫到
 
 ---
 
