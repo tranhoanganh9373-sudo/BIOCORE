@@ -32,10 +32,10 @@ biocore 已确定独立产品定位:**实验室发酵罐控制 + 时序数据采
 | M3 — trace_id + 统一响应格式 | ✅ 完成 | 6/6 | 实际 ~30min |
 | M4 — API Key 认证 | ✅ 完成 | 12/12 | 实际 ~1.5h |
 | M5 — Swagger 文档自动生成 | ✅ 代码就绪 | 10/11 (5.11 待人工浏览器验证) | 实际 ~45min |
-| M6 — WebSocket 鉴权 + 协议文档 | ✅ 完成 | 7/7 | 实际 ~30min |
+| M6 — WebSocket 鉴权 + 协议文档 | ✅ 代码就绪 | 5/7 (6.6/6.7 待人工 wscat 验证) | 实际 ~30min |
 | M7 — MOCK_PLC 环境变量化 | ✅ 完成 | 4/4 | 实际 ~15min |
 | M8 — 集成验证 + 文档 | ✅ 完成 | 9/9 | 实际 ~30min |
-| **合计** | **67/67** | **100%** | **实际 ~5h (vs 估时 25-35h)** |
+| **合计** | **65/67** (2 项待人工 wscat 验证) | **97%** | **实际 ~5h (vs 估时 25-35h)** |
 
 执行顺序: M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8(M1 是其他模块的基础,必须先做)
 
@@ -240,13 +240,13 @@ biocore 已确定独立产品定位:**实验室发酵罐控制 + 时序数据采
 - 现有前端 `realtime-store.ts` 同步改造,挂载时拼接 token
 
 ### 任务清单
-- [ ] **6.1** 修改 `packages/server/src/index.ts:293-296` 的 `wss.on('connection', (ws, req) => ...)` — 从 `req.url` 解析 `token` 或 `api_key`,调用 `verifyJWT` 或 API Key 校验
-- [ ] **6.2** 鉴权失败时 `ws.close(1008, 'Unauthorized')` 并 `console.warn` 来源 IP
-- [ ] **6.3** 鉴权成功后把 user 挂到 `(ws as any).user`,日志中带 user_id
-- [ ] **6.4** 修改 `packages/web-ui/src/stores/realtime-store.ts:96` 的 `connect: (url = ...)` — 从 localStorage 读 token,拼接 `?token=${encodeURIComponent(token)}` 到 URL
-- [ ] **6.5** 创建 `docs/WS_PROTOCOL.md` — 含连接 URL 格式、close code 含义、所有 channel 列表(从 broadcast 调用提取: heartbeat / recipe_downloaded / ai_suggestion / state_update / step_progress / alarm / pv_realtime / calculated / cusum / soft_sensor)、每个 channel 的 payload schema 示例、重连建议
-- [ ] **6.6** 验证: `wscat -c "ws://localhost:3001/ws"` 期望 close 1008
-- [ ] **6.7** 验证: `wscat -c "ws://localhost:3001/ws?token=$JWT_TOKEN"` 期望连接成功并能收到广播消息
+- [x] **6.1** 修改 `packages/server/src/index.ts:293-296` 的 `wss.on('connection', (ws, req) => ...)` — 从 `req.url` 解析 `token` 或 `api_key`,调用 `verifyJWT` 或 API Key 校验 — 完成于 2026-05-25(v1.9.0 P2 bucket 1 已抽出到 `packages/server/src/ws-server.ts:101-145`;index.ts 仅保留 `createWsServer({verifyJWT, authEnabled, ...})` 注入;JWT 优先 → API Key fallback → 用 `safeCompareApiKeyHash`+`timingSafeEqual` 防 timing attack)
+- [x] **6.2** 鉴权失败时 `ws.close(1008, 'Unauthorized')` 并 `console.warn` 来源 IP — 完成于 2026-05-25(`ws-server.ts:132-136` `console.warn('[WS] 未授权连接拒绝: ${remoteIp}')` + `ws.close(1008, 'Unauthorized')`)
+- [x] **6.3** 鉴权成功后把 user 挂到 `(ws as any).user`,日志中带 user_id — 完成于 2026-05-25(`ws-server.ts:142-144` `(ws as any).user = user;` + connect/close 两个 log 都带 `user_id`)
+- [x] **6.4** 修改 `packages/web-ui/src/stores/realtime-store.ts:96` 的 `connect: (url = ...)` — 从 localStorage 读 token,拼接 `?token=${encodeURIComponent(token)}` 到 URL — 完成于 2026-05-25(`realtime-store.ts:183-191` 读 `localStorage.getItem('biocore_token')`;无 token 时 fallback 用 `baseUrl` 原样连接,生产 `AUTH_ENABLED=true` 下会被服务端 close(1008),开发 `AUTH_ENABLED=false` 仍可用)
+- [x] **6.5** 创建 `docs/WS_PROTOCOL.md` — 含连接 URL 格式、close code 含义、所有 channel 列表(从 broadcast 调用提取: heartbeat / recipe_downloaded / ai_suggestion / state_update / step_progress / alarm / pv_realtime / calculated / cusum / soft_sensor)、每个 channel 的 payload schema 示例、重连建议 — 完成于 2026-05-25(`docs/WS_PROTOCOL.md` 138 行;实际广播 14 个 channel 全列出,spec 提到的 `calculated` 在 src 不存在已标注;补 query-string 安全提示 + WSS 推荐 + 未来 `Sec-WebSocket-Protocol` 子协议计划)
+- [ ] **6.6** 验证: `wscat -c "ws://localhost:3001/ws"` 期望 close 1008 — 代码就绪, 待人工 wscat 验证(本机 server 不在跑;`ws-server.ts:132-136` 路径已 trace 到 close(1008))
+- [ ] **6.7** 验证: `wscat -c "ws://localhost:3001/ws?token=$JWT_TOKEN"` 期望连接成功并能收到广播消息 — 代码就绪, 待人工 wscat 验证(`ws-server.ts:101-145` JWT 路径 + 后续 `broadcast()` 已 trace)
 
 **关键文件路径:**
 - 修改: `packages/server/src/index.ts:293-296`

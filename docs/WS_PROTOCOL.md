@@ -26,6 +26,11 @@ const apiKey = 'ak_xxx.xxxxx';
 const ws = new WebSocket(`ws://localhost:3001/ws?api_key=${encodeURIComponent(apiKey)}`);
 ```
 
+> **安全提示**: `token` / `api_key` 出现在 URL 查询字符串中,可能被中间代理(Nginx/防火墙)的 access log 记录,也可能在浏览器 history / referrer 中泄露。
+> - **生产环境强烈建议走 WSS** (TLS 加密链路) 屏蔽链路嗅探;
+> - 未来版本计划改走 `Sec-WebSocket-Protocol` 子协议头方式传 credential (本期按 spec 仍用 query string 以兼容 wscat / 浏览器原生 `WebSocket()`);
+> - API Key 应限定最小 scope, 定期轮换, 一旦泄露立即在 `/settings/api-keys` revoke。
+
 ### Close codes
 
 | Code | 含义 | 客户端应做的事 |
@@ -63,10 +68,16 @@ const ws = new WebSocket(`ws://localhost:3001/ws?api_key=${encodeURIComponent(ap
 | `recipe_downloaded` | 配方下载到反应器 | `{ "reactor_id": "Reactor-1", "recipe_id": "ECOLI_V1", "version": "1.0.0", "phases": [...] }` |
 | `alarm` | 新报警触发 | `{ "id": 42, "severity": "warning", "message": "...", "batch_id": "..." }` |
 | `heartbeat` | PLC 心跳 (1Hz) | `{ "pc": 1234, "alive": true }` |
-| `calculated` | 软件测算值更新 | `{ "OUR": 12.5, "kLa": 80.0, "mu": 0.3, ... }` |
 | `cusum` | CUSUM 异常检测告警 | `[{ "channel": "temperature", "deviation": 2.3, "alarming": true }]` |
 | `ai_suggestion` | AI 模块产生新建议 | `{ "id": "...", "suggestion_type": "feed_rate", "current_value": 5, "suggested_value": 7 }` |
 | `soft_sensor` | 软测量推断结果 | `{ "biomass": 12.3, "substrate": 5.1, "product": 8.7 }` |
+| `branch_evaluated` | DAG 配方分支判定 (`payload_version=2`) | `{ "reactor_id": "Reactor-1", "type": "branch_evaluated", "payload_version": 2, "batch_id": "...", "node_id": "...", "result": true }` |
+| `loop_entered` | DAG 配方循环进入 (`payload_version=2`) | `{ "reactor_id": "Reactor-1", "type": "loop_entered", "payload_version": 2, "batch_id": "...", "node_id": "..." }` |
+| `loop_iterated` | DAG 配方循环单次迭代 (`payload_version=2`) | `{ "reactor_id": "Reactor-1", "type": "loop_iterated", "payload_version": 2, "batch_id": "...", "node_id": "...", "iteration": 3 }` |
+| `loop_exited` | DAG 配方循环退出 (`payload_version=2`) | `{ "reactor_id": "Reactor-1", "type": "loop_exited", "payload_version": 2, "batch_id": "...", "node_id": "...", "reason": "max_iterations \| condition_false" }` |
+| `suggestion_new` | MQTT 上游写建议入库 | `{ "id": "...", "source": "...", "target_param": "...", "suggested_value": 7, "batch_id": "..." \| null }` |
+
+> 说明: spec 草案曾列出 `calculated` channel,但当前 server 源码无 `broadcast('calculated', ...)` 调用,已从本表移除。OUR/kLa/mu 等软测算值通过 `soft_sensor` 推送。
 
 ## 4. 重连策略
 
