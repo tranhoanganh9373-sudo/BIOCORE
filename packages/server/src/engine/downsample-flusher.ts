@@ -27,12 +27,17 @@
 //     field per reactor per 10s.
 //   - 备选 LTTB 在 targetPoints<=2 时退化到首尾两点, 不适合 "压成 1 个
 //     代表值" 场景, 故选 mean. 详见 lib/downsample.ts JSDoc.
+//
+// SP-PLC-3 P3a.4: 加 DOWNSAMPLE_ALGORITHM env 切换:
+//   - 'mean' (默认, 行为完全 = Phase 2): 1 字段 per tag.
+//   - 'minmaxavg': 每 tag 写 3 字段 (_min/_max/_avg), 适合监控/告警
+//     dashboard 需要保留窗口极值的场景. InfluxDB 写入量是 mean 模式 3 倍.
 // ============================================================
 
 import { Point } from '@influxdata/influxdb-client';
 import type { WriteApi } from '@influxdata/influxdb-client';
 import type { TagCache, CacheChange } from './tag-cache';
-import { meanDownsample } from '../lib/downsample';
+import { meanDownsample, minMaxAvgDownsample } from '../lib/downsample';
 
 /** 单 reactor:tag 的 10s 窗口累积. */
 interface FieldAccum {
@@ -83,6 +88,13 @@ const DOWNSAMPLE_TAG_SET = new Set<string>(DOWNSAMPLE_FIELDS.map((f) => f.tag));
  */
 export function startDownsampleFlusher(deps: DownsampleFlusherDeps): () => void {
   const flushMs = deps.flushMs ?? readEnvInt('DOWNSAMPLE_FLUSH_MS', DEFAULT_FLUSH_MS);
+  // SP-PLC-3 P3a.4: 启动期 once 读取 algorithm (避免每 tick 重读 process.env).
+  // 默认 'mean' = Phase 2 行为 (1 字段 per tag); 'minmaxavg' = 3 字段 per tag.
+  // 任何非法值 (非两者之一) fallback 'mean', 不抛.
+  const algorithm: 'mean' | 'minmaxavg' =
+    (process.env.DOWNSAMPLE_ALGORITHM ?? 'mean').toLowerCase() === 'minmaxavg'
+      ? 'minmaxavg'
+      : 'mean';
 
   // 累积 buffer: key = `${reactorId}:${tag}`, value = 窗口内 quality=good 的值数组.
   // 闭包 scope: stop 后随闭包 GC, 多 flusher 实例隔离.
@@ -138,12 +150,26 @@ export function startDownsampleFlusher(deps: DownsampleFlusherDeps): () => void 
           const key = `${reactorId}:${tag}`;
           const buf = accum.get(key);
           if (!buf || buf.values.length === 0) continue;
-          // meanDownsample(values, 1) → [mean]. 边界 (length=0) 已上 skip.
-          const downsampled = meanDownsample(buf.values, 1);
-          if (downsampled.length > 0) {
-            const value = transform ? transform(downsampled[0]) : downsampled[0];
-            point.floatField(field, value);
-            fieldCount++;
+          if (algorithm === 'minmaxavg') {
+            // SP-PLC-3 P3a.4: 写 3 字段 per tag (_min/_max/_avg).
+            // 边界 (length=0) 已上 skip; minMaxAvgDownsample(values, 1) → [{min,max,avg}].
+            const agg = minMaxAvgDownsample(buf.values, 1);
+            if (agg.length > 0) {
+              const { min, max, avg } = agg[0];
+              point.floatField(`${field}_min`, transform ? transform(min) : min);
+              point.floatField(`${field}_max`, transform ? transform(max) : max);
+              point.floatField(`${field}_avg`, transform ? transform(avg) : avg);
+              fieldCount += 3;
+            }
+          } else {
+            // 默认 'mean' = Phase 2 行为, 1 字段 per tag.
+            // meanDownsample(values, 1) → [mean]. 边界 (length=0) 已上 skip.
+            const downsampled = meanDownsample(buf.values, 1);
+            if (downsampled.length > 0) {
+              const value = transform ? transform(downsampled[0]) : downsampled[0];
+              point.floatField(field, value);
+              fieldCount++;
+            }
           }
           // reset buffer (无论是否 noWrite, 都清以避免内存泄漏).
           accum.set(key, { values: [] });

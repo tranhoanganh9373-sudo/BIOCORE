@@ -261,4 +261,91 @@ describe('SP-PLC-3 P2.5 — startDownsampleFlusher', () => {
     // tick 跑过且 buffer reset (内部代码路径覆盖); 无 api 可观测 Point.
     stop();
   });
+
+  // ============================================================
+  // SP-PLC-3 P3a.4: DOWNSAMPLE_ALGORITHM env 切换 (+2 tests)
+  // ============================================================
+
+  // P3a.4-1: ALGORITHM='minmaxavg' 写 3 字段 per tag (_min/_max/_avg)
+  it("DOWNSAMPLE_ALGORITHM='minmaxavg' 写 3 字段 per tag (temperature_min/_max/_avg, rpm 仍 ×24 transform)", () => {
+    const origAlgo = process.env.DOWNSAMPLE_ALGORITHM;
+    process.env.DOWNSAMPLE_ALGORITHM = 'minmaxavg';
+    try {
+      const { api, points } = makeWriteApi();
+      const stop = startDownsampleFlusher({
+        tagCache: cache,
+        influxDownsampleApi: api,
+        reactorIds: () => ['R1'],
+        getBatchId: () => 'b1',
+        flushMs: 10000,
+      });
+
+      // 3 个不同 TEMP_PV: min=36, max=38, avg=37
+      cache.write('R1', snap({ TEMP_PV: 36 }));
+      cache.write('R1', snap({ TEMP_PV: 37 }));
+      cache.write('R1', snap({ TEMP_PV: 38 }));
+      // 2 个 VFD_ACTUAL_FREQ: min=24, max=25, avg=24.5;
+      // transform ×24 → rpm_min=576, rpm_max=600, rpm_avg=588
+      cache.write('R1', snap({ VFD_ACTUAL_FREQ: 24 }));
+      cache.write('R1', snap({ VFD_ACTUAL_FREQ: 25 }));
+
+      vi.advanceTimersByTime(10000);
+      expect(points).toHaveLength(1);
+      expect(points[0].measurement).toBe('process_data_downsampled');
+      expect(points[0].tags).toEqual({ reactor_id: 'R1', batch_id: 'b1' });
+
+      const fieldMap = new Map(points[0].fields);
+      // temperature_*
+      expect(fieldMap.get('temperature_min')).toBe(36);
+      expect(fieldMap.get('temperature_max')).toBe(38);
+      expect(fieldMap.get('temperature_avg')).toBe(37);
+      // rpm_* (transform ×24 应用到 min/max/avg 各自)
+      expect(fieldMap.get('rpm_min')).toBe(576);
+      expect(fieldMap.get('rpm_max')).toBe(600);
+      expect(fieldMap.get('rpm_avg')).toBe(588);
+      // 单字段名 (mean 模式后缀) 不应存在
+      expect(fieldMap.has('temperature')).toBe(false);
+      expect(fieldMap.has('rpm')).toBe(false);
+
+      stop();
+    } finally {
+      // 恢复 env 防污染后续 test
+      if (origAlgo === undefined) delete process.env.DOWNSAMPLE_ALGORITHM;
+      else process.env.DOWNSAMPLE_ALGORITHM = origAlgo;
+    }
+  });
+
+  // P3a.4-2: ALGORITHM 未设 (默认 'mean') 行为不变 (P2.5 1 字段 per tag)
+  it('DOWNSAMPLE_ALGORITHM 未设 默认 mean 行为不变 (1 字段 per tag, P2.5 baseline)', () => {
+    const origAlgo = process.env.DOWNSAMPLE_ALGORITHM;
+    delete process.env.DOWNSAMPLE_ALGORITHM;
+    try {
+      const { api, points } = makeWriteApi();
+      const stop = startDownsampleFlusher({
+        tagCache: cache,
+        influxDownsampleApi: api,
+        reactorIds: () => ['R1'],
+        getBatchId: () => 'b1',
+        flushMs: 10000,
+      });
+
+      cache.write('R1', snap({ TEMP_PV: 36 }));
+      cache.write('R1', snap({ TEMP_PV: 38 }));
+
+      vi.advanceTimersByTime(10000);
+      expect(points).toHaveLength(1);
+      const fieldMap = new Map(points[0].fields);
+      // mean 模式: 单字段 temperature=37 (mean of 36,38)
+      expect(fieldMap.get('temperature')).toBe(37);
+      // 3 字段后缀不应存在
+      expect(fieldMap.has('temperature_min')).toBe(false);
+      expect(fieldMap.has('temperature_max')).toBe(false);
+      expect(fieldMap.has('temperature_avg')).toBe(false);
+
+      stop();
+    } finally {
+      if (origAlgo === undefined) delete process.env.DOWNSAMPLE_ALGORITHM;
+      else process.env.DOWNSAMPLE_ALGORITHM = origAlgo;
+    }
+  });
 });

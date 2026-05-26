@@ -79,3 +79,64 @@ export function meanDownsample(values: number[], targetPoints = 1): number[] {
   }
   return out;
 }
+
+/**
+ * SP-PLC-3 P3a.4: min/max/avg 分桶聚合.
+ *
+ * 与 meanDownsample 单值不同, 此算法每桶返回 {min, max, avg} 3 元组,
+ * 适用于监控/告警/SPC 场景需要保留窗口极值的 dashboard (例如某 10s 窗口
+ * 内 pH 瞬时尖峰若仅取均值会被洗掉, 而 min/max 能保留并触发告警).
+ *
+ * 等距分桶: 与 meanDownsample 同一桶切分规则
+ * (`bucketSize = values.length / targetPoints`,
+ * 边界 `Math.floor(i * bucketSize) ~ Math.floor((i+1) * bucketSize)`),
+ * 保证两算法对相同 input 切相同的桶, 仅聚合方式不同.
+ *
+ * 边界:
+ *   - values.length === 0 → []
+ *   - targetPoints <= 0 → []
+ *   - targetPoints >= values.length → 每桶 1 值 → {min=max=avg=value}
+ *   - 单值数组 → [{min=max=avg=value}]
+ *
+ * 不做加权 / 不剔异常值 (与 meanDownsample 对齐).
+ *
+ * @param values - 原始数值序列 (时间先后顺序).
+ * @param targetPoints - 目标点数 (默认 1 = 全窗口 1 个聚合三元组).
+ */
+export interface MinMaxAvgPoint {
+  min: number;
+  max: number;
+  avg: number;
+}
+
+export function minMaxAvgDownsample(
+  values: number[],
+  targetPoints = 1,
+): MinMaxAvgPoint[] {
+  if (values.length === 0 || targetPoints <= 0) return [];
+  if (targetPoints >= values.length) {
+    return values.map((v) => ({ min: v, max: v, avg: v }));
+  }
+
+  const out: MinMaxAvgPoint[] = [];
+  const bucketSize = values.length / targetPoints;
+  for (let i = 0; i < targetPoints; i++) {
+    const lo = Math.floor(i * bucketSize);
+    const hi = Math.floor((i + 1) * bucketSize);
+    const end = Math.min(hi, values.length);
+    if (lo >= end) continue; // 空桶 skip (理论上不发生, 防御性)
+    let min = values[lo];
+    let max = values[lo];
+    let sum = 0;
+    let count = 0;
+    for (let j = lo; j < end; j++) {
+      const v = values[j];
+      if (v < min) min = v;
+      if (v > max) max = v;
+      sum += v;
+      count++;
+    }
+    out.push({ min, max, avg: sum / count });
+  }
+  return out;
+}
