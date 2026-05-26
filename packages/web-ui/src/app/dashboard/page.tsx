@@ -7,9 +7,10 @@
 
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import Link from 'next/link';
 import { useRealtimeStore } from '@/stores/realtime-store';
+import { createTrendBuffer } from '@/stores/realtime-store';
 import dynamic from 'next/dynamic';
 import { ControlPanel } from '@/components/dashboard/ControlPanel';
 import { TrendChartGroup } from '@/components/dashboard/TrendChartGroup';
@@ -119,7 +120,11 @@ export default function DashboardPage() {
     ? (_isReactorActive ? (_rd?.calculatedParams ?? null) : null)
     : _topCalculatedParams;
   const alarms = _rd?.alarms ?? (selectedReactor ? [] : _topAlarms);
-  const _emptyTrend = { timestamps: [], temperature: [], pH: [], DO: [], rpm: [], airflow: [] };
+  // SP-PLC-3 Patch B: trendBuffer 现是 RingBuffer 实例 wrapper.
+  // idle 反应器仍要 "无数据" 占位 — 用 useMemo 锁住一个空 buffer 实例
+  // (mount 一次, 之后不重 alloc), 避免每 render 都 new 一组 RingBuffer.
+  // 注意: 这是占位 read-only 实例, 上层 dashboard 只读不 push.
+  const _emptyTrend = useMemo(() => createTrendBuffer(), []);
   const trendBuffer = selectedReactor
     ? (_isReactorActive ? (_rd?.trendBuffer ?? _topTrendBuffer) : _emptyTrend)
     : _topTrendBuffer;
@@ -266,9 +271,12 @@ export default function DashboardPage() {
           {/* ③ 实时趋势图 (按布局配置显隐) */}
           {dashLayout.showTrends && (
           <TrendChartGroup
-            tempHistory={trendBuffer.temperature}
-            phHistory={trendBuffer.pH}
-            doHistory={trendBuffer.DO}
+            // SP-PLC-3 Patch B: trendBuffer.* 现是 RingBuffer 实例, .toArray() 物化为
+            // number[] (TrendChartGroup prop 类型不变, 完全兼容).
+            // Follow-up: 高频 re-render 下可 useMemo 包裹 toArray() 调用 (本 Patch 不做).
+            tempHistory={trendBuffer.temperature.toArray()}
+            phHistory={trendBuffer.pH.toArray()}
+            doHistory={trendBuffer.DO.toArray()}
             currentTemp={temp}
             currentPH={ph}
             currentDO={doVal}

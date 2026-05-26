@@ -38,6 +38,10 @@ Options:
 - `windowSec?: number` — 历史时间窗口, 默认 60s
 - `staleMs?: number` — 数据年龄阈值, 默认 5000ms; 超出则 isStale=true
 
+**SP-PLC-3 Patch B (2026-05-26)**: `realtime-store.trendBuffer` 内部从裸数组改成
+`RingBuffer` 实例 (write 端 O(1) push, 不再触发 5×3600 spread+slice). `useTagHistory`
+内部自动调 `toArray()` 物化, 返值 shape (`{ points, isStale }`) 不变, 调用者零改动.
+
 ## 生产 staleMs 设置
 
 `DEFAULT_STALE_MS = 5000`. **SP-PLC-3 P3 (2026-05-25)** 之后 broadcaster 改 5Hz

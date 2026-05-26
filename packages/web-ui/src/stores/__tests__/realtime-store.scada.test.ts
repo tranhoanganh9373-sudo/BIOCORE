@@ -1,6 +1,7 @@
 import React from 'react';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { useRealtimeStore } from '../realtime-store';
+import { useRealtimeStore, createTrendBuffer } from '../realtime-store';
+import { RingBuffer } from '../ring-buffer';
 
 function dispatch(msg: any) {
   // The WS onmessage handler is private inside connect(). For unit-level coverage
@@ -62,7 +63,8 @@ describe('realtime-store pv_realtime quality (Patch A)', () => {
           cusumAlerts: [],
           cusumHistory: {},
           softSensorData: null,
-          trendBuffer: { timestamps: [], temperature: [], pH: [], DO: [], rpm: [], airflow: [] },
+          // SP-PLC-3 Patch B: trendBuffer 改 RingBuffer wrapper
+          trendBuffer: createTrendBuffer(),
           qualityMap,
         },
       },
@@ -75,5 +77,65 @@ describe('realtime-store pv_realtime quality (Patch A)', () => {
     });
     // 旧字段不破
     expect(rd.processValues?.['AI-0']).toBe(37.5);
+  });
+});
+
+// SP-PLC-3 Patch B: trendBuffer 从裸 array 切到 RingBuffer 实例.
+// 验证 (1) createTrendBuffer alloc 6 个独立 RingBuffer, (2) push 不 alloc
+// 顶层数组, (3) cross-reactor 独立 (F01 push 不影响 F02), (4) toArray 物化
+// 出 plain array 兼容下游 chart 组件.
+describe('realtime-store trendBuffer (Patch B RingBuffer)', () => {
+  beforeEach(() => {
+    useRealtimeStore.setState({ reactorData: {}, trendBuffer: createTrendBuffer() });
+  });
+
+  it('createTrendBuffer 返 6 个独立 RingBuffer 实例 (capacity 3600)', () => {
+    const buf = createTrendBuffer();
+    expect(buf.timestamps).toBeInstanceOf(RingBuffer);
+    expect(buf.temperature).toBeInstanceOf(RingBuffer);
+    expect(buf.pH).toBeInstanceOf(RingBuffer);
+    expect(buf.DO).toBeInstanceOf(RingBuffer);
+    expect(buf.rpm).toBeInstanceOf(RingBuffer);
+    expect(buf.airflow).toBeInstanceOf(RingBuffer);
+    expect(buf.timestamps.capacity).toBe(3600);
+    expect(buf.temperature.capacity).toBe(3600);
+  });
+
+  it('push 后 toArray 返 number[] 兼容 chart prop', () => {
+    const buf = createTrendBuffer();
+    buf.timestamps.push('2026-05-26T10:00:00Z');
+    buf.temperature.push(37.5);
+    buf.pH.push(7.0);
+    const arr = buf.temperature.toArray();
+    expect(arr).toEqual([37.5]);
+    expect(Array.isArray(arr)).toBe(true);
+  });
+
+  it('cross-reactor 独立: F01 push 不污染 F02 buffer', () => {
+    const bufF01 = createTrendBuffer();
+    const bufF02 = createTrendBuffer();
+    bufF01.temperature.push(37);
+    bufF01.temperature.push(38);
+    expect(bufF01.temperature.toArray()).toEqual([37, 38]);
+    expect(bufF02.temperature.toArray()).toEqual([]);
+    expect(bufF01.temperature).not.toBe(bufF02.temperature);
+  });
+
+  it('超 capacity wraparound: 仅保最新 3600 点 (用 capacity=5 mock 验语义)', () => {
+    // 真实 3600 太慢, 验 ring 语义即可 — 单测细节已在 ring-buffer.test.ts 覆盖
+    const ring = new RingBuffer<number>(5);
+    for (let i = 1; i <= 7; i++) ring.push(i);
+    expect(ring.toArray()).toEqual([3, 4, 5, 6, 7]);
+  });
+
+  it('mutation 不破坏 store 一致性: push 后 trendBuffer 引用稳定 (wrapper-clone 由 reducer 负责)', () => {
+    // 验 createTrendBuffer 返的 RingBuffer 实例可独立 push, 不依赖 set() 触发.
+    // store reducer (case pv_realtime) 在 push 后 set({ trendBuffer: {...buf} }) wrapper clone
+    // 触发 selector 但 RingBuffer 实例引用本身不变 — 验这一不变量.
+    const initial = useRealtimeStore.getState().trendBuffer;
+    initial.temperature.push(37.5);
+    // 直接 push 后实例引用不变 (此处不模拟 reducer 的 wrapper clone)
+    expect(useRealtimeStore.getState().trendBuffer.temperature).toBe(initial.temperature);
+    expect(initial.temperature.toArray()).toEqual([37.5]);
   });
 });

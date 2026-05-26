@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useRealtimeStore } from '@/stores/realtime-store';
+import { useRealtimeStore, createTrendBuffer } from '@/stores/realtime-store';
 import { useTag } from '../useTag';
 
 function resetStore() {
@@ -20,7 +20,8 @@ function resetStore() {
     softSensorData: null,
     reactorStates: {},
     reactorRecipes: {},
-    trendBuffer: { timestamps: [], temperature: [], pH: [], DO: [], rpm: [], airflow: [] },
+    // SP-PLC-3 Patch B: trendBuffer 改 RingBuffer wrapper, helper alloc fresh 实例
+    trendBuffer: createTrendBuffer(),
     batchRuntime: {},
     recentBranchEvaluations: [],
   });
@@ -52,7 +53,8 @@ function seedReactor(opts: {
         cusumAlerts: [],
         cusumHistory: {},
         softSensorData: null,
-        trendBuffer: { timestamps: [], temperature: [], pH: [], DO: [], rpm: [], airflow: [] },
+        // SP-PLC-3 Patch B: 每个 reactor 独立 RingBuffer wrapper, 严禁共享
+        trendBuffer: createTrendBuffer(),
         qualityMap,
       },
     },

@@ -50,9 +50,14 @@ export function useTagHistory(tagId: string, opts: UseTagHistoryOpts = {}): TagH
   const bufferKey = TREND_FIELD_MAP[parsed.field];
   if (!bufferKey) return { points: [], isStale };
 
+  // SP-PLC-3 Patch B: trendBuffer 现在是 RingBuffer 实例, 必须 toArray() 物化.
+  // 每次 hook re-run alloc 两个新 array (timestamps + values, 各 ≤3600 元素),
+  // 远低于原 5Hz × 5 数组 spread+slice 的写端 alloc 量.
+  // Follow-up (Patch C 或后续): 若 chart 重渲染频率成瓶颈, 在调用端 useMemo
+  // (依赖 trendBuffer 引用) 包裹 toArray() 调用.
   const trend = reactorData.trendBuffer;
-  const timestamps = trend.timestamps;
-  const values = trend[bufferKey];
+  const timestamps = trend.timestamps.toArray();
+  const values = trend[bufferKey].toArray();
   if (!timestamps.length || !values.length) {
     return { points: [], isStale };
   }

@@ -14,6 +14,43 @@ import type {
   BranchEvaluationEntry,
 } from '@/types';
 import type { TagQuality } from '@/hooks/useTag';
+import { RingBuffer } from './ring-buffer';
+
+// SP-PLC-3 Patch B (2026-05-26): trendBuffer 改 RingBuffer 消除 5×3600 数组
+// spread + slice (audit Finding 1, 估 14 MB/s alloc @ 10 reactor × 5 Hz).
+// 容量 = 60 min × 60 s = 3600 点 (1 Hz 上限; 5 Hz 时仅保最后 12 min, 由
+// dashboard 视图按 windowSec=60 截窗, 业务无回归).
+const TREND_CAPACITY = 3600;
+
+/**
+ * SP-PLC-3 Patch B: 新建一组 fresh RingBuffer 实例的 trendBuffer.
+ * 必须每个 reactor / legacy slot 各自调用 — 避免共享底层数组引用导致 cross-reactor
+ * 污染 (e.g. F01 的 push 写到 F02 的 buffer).
+ *
+ * 导出供外部 (dashboard idle 占位 / 测试 seed) 构造空 buffer 时调用; 内部 store
+ * 写路径同样复用此 helper. RingBuffer 是 mutable, 调用方禁止把同一个返回值
+ * 跨多个 reactor 共享.
+ */
+export function createTrendBuffer(): TrendBuffer {
+  return {
+    timestamps: new RingBuffer<string>(TREND_CAPACITY),
+    temperature: new RingBuffer<number>(TREND_CAPACITY),
+    pH: new RingBuffer<number>(TREND_CAPACITY),
+    DO: new RingBuffer<number>(TREND_CAPACITY),
+    rpm: new RingBuffer<number>(TREND_CAPACITY),
+    airflow: new RingBuffer<number>(TREND_CAPACITY),
+  };
+}
+
+/** trendBuffer shape — write 端 push() O(1), 读端按需 toArray(). */
+export interface TrendBuffer {
+  timestamps: RingBuffer<string>;
+  temperature: RingBuffer<number>;
+  pH: RingBuffer<number>;
+  DO: RingBuffer<number>;
+  rpm: RingBuffer<number>;
+  airflow: RingBuffer<number>;
+}
 
 interface HeartbeatStatus {
   pc: number;
@@ -70,14 +107,7 @@ export interface ReactorRuntimeData {
   cusumAlerts: Array<{ channel: string; deviation: number; alarming: boolean; cumPos: number; cumNeg: number }>;
   cusumHistory: Record<string, Array<{ t: number; cumPos: number; cumNeg: number; deviation: number }>>;
   softSensorData: SoftSensorData | null;
-  trendBuffer: {
-    timestamps: string[];
-    temperature: number[];
-    pH: number[];
-    DO: number[];
-    rpm: number[];
-    airflow: number[];
-  };
+  trendBuffer: TrendBuffer;
   /**
    * P3+: PLC tag quality 三态映射 (keyed by PLC tag name, e.g. 'TEMP_PV').
    * 由 `pv_realtime` payload 的 `quality` 嵌套对象注入. 可选 — legacy server
@@ -86,6 +116,11 @@ export interface ReactorRuntimeData {
   qualityMap?: Record<string, TagQuality>;
 }
 
+// SP-PLC-3 Patch B: 共享 sentinel — 读取 fallback 用 (e.g. case 'alarm' / 'cusum'
+// 在 reactorData[rid] 缺失时返默认值). **trendBuffer 是 RingBuffer 实例**, push 会
+// mutate 内部数组. 若多 reactor 共享同一 sentinel.trendBuffer 引用, 写入会 cross-污染.
+// 因此 write 路径 (主要 pv_realtime) 必须检测 `prev === EMPTY_REACTOR_DATA` 并 alloc
+// fresh trendBuffer (见 case 'pv_realtime' 的 prevReactor 处理).
 const EMPTY_REACTOR_DATA: ReactorRuntimeData = {
   processValues: null,
   stateUpdate: null,
@@ -94,7 +129,7 @@ const EMPTY_REACTOR_DATA: ReactorRuntimeData = {
   cusumAlerts: [],
   cusumHistory: {},
   softSensorData: null,
-  trendBuffer: { timestamps: [], temperature: [], pH: [], DO: [], rpm: [], airflow: [] },
+  trendBuffer: createTrendBuffer(),
 };
 
 interface RealtimeState {
@@ -129,14 +164,8 @@ interface RealtimeState {
   reactorData: Record<string, ReactorRuntimeData>;
 
   // 趋势数据缓冲 (最近60分钟, 用于Dashboard趋势图)
-  trendBuffer: {
-    timestamps: string[];
-    temperature: number[];
-    pH: number[];
-    DO: number[];
-    rpm: number[];
-    airflow: number[];
-  };
+  // SP-PLC-3 Patch B: 改 RingBuffer 实例 (push O(1)); 读端 toArray() 物化 plain array.
+  trendBuffer: TrendBuffer;
 
   // T18: per-batch DAG runtime state (keyed by batch_id)
   batchRuntime: Record<string, BatchRuntimeState>;
@@ -182,7 +211,7 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
   reactorStates: {},
   reactorRecipes: {},
   reactorData: {},
-  trendBuffer: { timestamps: [], temperature: [], pH: [], DO: [], rpm: [], airflow: [] },
+  trendBuffer: createTrendBuffer(),
   batchRuntime: {},
   recentBranchEvaluations: [],
   _scadaViewSavedTick: null,
@@ -227,10 +256,12 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
 
       switch (msg.channel) {
         case 'pv_realtime': {
-          // 追加到趋势缓冲 (single set() call)
-          // T13 风险 #5 缓解：环形缓冲上限 3600 = 60min × 1Hz, 防止 24h dashboard 视图无限增长。
-          const buf = get().trendBuffer;
-          const MAX_POINTS = 3600;
+          // SP-PLC-3 Patch B (2026-05-26): trendBuffer 改 RingBuffer 实例.
+          // write 端: O(1) push 不 alloc; **mutation 不触发 Zustand selector re-run**,
+          //   故 push 后必须 `set({ trendBuffer: { ...buf } })` shallow-clone wrapper
+          //   object — RingBuffer 实例引用不变 (无 cross-render copy), 仅 wrapper 对象
+          //   alloc, 比原 5×3600 数组 spread+slice 净 alloc 字节降 ~99%.
+          // 读端 (useTagHistory / dashboard): 调 buf.field.toArray() 物化为 plain array.
           const pv = msg.payload as ProcessValues;
           // SP-PLC-3 P3+: broadcaster 在 payload 加 `quality` 嵌套对象 (Record<plcTag,
           // 'good'|'bad'|'uncertain'>). 透传到 reactorData.qualityMap 让 useTag 暴露
@@ -240,32 +271,40 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
           const qualityMap = (msg.payload as any).quality as
             | Record<string, TagQuality>
             | undefined;
-          const nextTrend = {
-            timestamps: [...buf.timestamps, msg.timestamp].slice(-MAX_POINTS),
-            temperature: [...buf.temperature, msg.payload['AI-0'] ?? 0].slice(-MAX_POINTS),
-            pH: [...buf.pH, msg.payload['AI-2'] ?? 0].slice(-MAX_POINTS),
-            DO: [...buf.DO, msg.payload['AI-3'] ?? 0].slice(-MAX_POINTS),
-            rpm: [...buf.rpm, msg.payload.rpm ?? 0].slice(-MAX_POINTS),
-            airflow: [...buf.airflow, msg.payload['AI-5'] ?? 0].slice(-MAX_POINTS),
-          };
-          // legacy 顶层 (单反应器组件仍用) — quality 不进顶层 state slot, 仅进 reactorData.
-          set({ processValues: pv, trendBuffer: nextTrend });
+
+          // legacy 顶层 push (单反应器组件 + 测试仍用)
+          const topBuf = get().trendBuffer;
+          topBuf.timestamps.push(msg.timestamp);
+          topBuf.temperature.push(msg.payload['AI-0'] ?? 0);
+          topBuf.pH.push(msg.payload['AI-2'] ?? 0);
+          topBuf.DO.push(msg.payload['AI-3'] ?? 0);
+          topBuf.rpm.push(msg.payload.rpm ?? 0);
+          topBuf.airflow.push(msg.payload['AI-5'] ?? 0);
+          // wrapper clone (RingBuffer 实例引用不变, 仅 object 身份变 → selector re-run)
+          set({ processValues: pv, trendBuffer: { ...topBuf } });
+
           // 反应器隔离写入 (含 qualityMap)
           const rid = msg.reactor_id;
           if (rid) {
-            const prevReactor = get().reactorData[rid] || EMPTY_REACTOR_DATA;
-            const reactorTrend = prevReactor.trendBuffer;
+            const prevReactor = get().reactorData[rid];
+            // 首次写入 (reactorData[rid] 未建) 或 sentinel fallback 命中: alloc fresh
+            // trendBuffer 避免 cross-reactor 共享 EMPTY_REACTOR_DATA.trendBuffer 引用.
+            const reactorBuf: TrendBuffer =
+              prevReactor && prevReactor.trendBuffer !== EMPTY_REACTOR_DATA.trendBuffer
+                ? prevReactor.trendBuffer
+                : createTrendBuffer();
+            reactorBuf.timestamps.push(msg.timestamp);
+            reactorBuf.temperature.push(msg.payload['AI-0'] ?? 0);
+            reactorBuf.pH.push(msg.payload['AI-2'] ?? 0);
+            reactorBuf.DO.push(msg.payload['AI-3'] ?? 0);
+            reactorBuf.rpm.push(msg.payload.rpm ?? 0);
+            reactorBuf.airflow.push(msg.payload['AI-5'] ?? 0);
             updateReactor(rid, {
               processValues: pv,
               qualityMap,
-              trendBuffer: {
-                timestamps: [...reactorTrend.timestamps, msg.timestamp].slice(-MAX_POINTS),
-                temperature: [...reactorTrend.temperature, msg.payload['AI-0'] ?? 0].slice(-MAX_POINTS),
-                pH: [...reactorTrend.pH, msg.payload['AI-2'] ?? 0].slice(-MAX_POINTS),
-                DO: [...reactorTrend.DO, msg.payload['AI-3'] ?? 0].slice(-MAX_POINTS),
-                rpm: [...reactorTrend.rpm, msg.payload.rpm ?? 0].slice(-MAX_POINTS),
-                airflow: [...reactorTrend.airflow, msg.payload['AI-5'] ?? 0].slice(-MAX_POINTS),
-              },
+              // wrapper clone — RingBuffer 实例引用不变, 但 trendBuffer object 身份变
+              // 让 `s.reactorData[rid]?.trendBuffer` 订阅 hook (useTagHistory) re-run.
+              trendBuffer: { ...reactorBuf },
             });
           }
           break;

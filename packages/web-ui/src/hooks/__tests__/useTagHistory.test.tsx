@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { renderHook } from '@testing-library/react';
-import { useRealtimeStore } from '@/stores/realtime-store';
+import { useRealtimeStore, createTrendBuffer } from '@/stores/realtime-store';
 import { useTagHistory } from '../useTagHistory';
 
 function makeTimestamps(count: number, intervalSec = 1, anchor?: number): string[] {
@@ -18,14 +18,15 @@ function seedTrend(reactorId: string, trend: {
   rpm?: number[];
   airflow?: number[];
 }) {
-  const filled = {
-    timestamps: trend.timestamps,
-    temperature: trend.temperature ?? [],
-    pH: trend.pH ?? [],
-    DO: trend.DO ?? [],
-    rpm: trend.rpm ?? [],
-    airflow: trend.airflow ?? [],
-  };
+  // SP-PLC-3 Patch B: trendBuffer 改 RingBuffer 实例, 入参裸 array → push 到 fresh ring.
+  // 测试 case 4 同一 reactor 多次 seedTrend → 每次 alloc 新 buffer 不污染.
+  const filled = createTrendBuffer();
+  trend.timestamps.forEach((t) => filled.timestamps.push(t));
+  (trend.temperature ?? []).forEach((v) => filled.temperature.push(v));
+  (trend.pH ?? []).forEach((v) => filled.pH.push(v));
+  (trend.DO ?? []).forEach((v) => filled.DO.push(v));
+  (trend.rpm ?? []).forEach((v) => filled.rpm.push(v));
+  (trend.airflow ?? []).forEach((v) => filled.airflow.push(v));
   useRealtimeStore.setState({
     wsConnected: true,
     _tick: Date.now(),
@@ -61,7 +62,8 @@ function resetStore() {
     softSensorData: null,
     reactorStates: {},
     reactorRecipes: {},
-    trendBuffer: { timestamps: [], temperature: [], pH: [], DO: [], rpm: [], airflow: [] },
+    // SP-PLC-3 Patch B: trendBuffer 改 RingBuffer wrapper
+    trendBuffer: createTrendBuffer(),
     batchRuntime: {},
     recentBranchEvaluations: [],
   });
