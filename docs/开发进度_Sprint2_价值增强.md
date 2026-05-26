@@ -36,8 +36,8 @@ Sprint 1 已经把 biocore 升级为可被外部系统调用的微服务(`/api/v
 | M2.3 — 多反应器/多批次对比 ✅ | 前端并行 fetch 多反应器,按经过秒数对齐 | 8/8 | 实际 ~1h |
 | M2.4 — 离线取样字段扩展 ✅ | migration 004 + sqlite-service + 批次详情页 UI | 11/11 | 实际 ~0.7h |
 | M2.5 — 设备类型扩展 ✅ | migration 005 + 设备配置页 category 选择 | 7/7 | 实际 ~0.5h |
-| M2.6 — 原料库 M9(完整) ✅ | migration 006 + 7 端点 + multer + 原料库前端页 + 物性曲线编辑器 | 22/22 | 实际 ~2h |
-| **合计** | | **70/70 ✅** | **30-35h(实际 ~6h)** |
+| M2.6 — 原料库 M9 ~~已撤销~~ | 2026-04-08 ship → 2026-05-15 reverted (commit `0c573fc`),改走 recipes 内嵌物料 | ~~22/22~~ 0/0 | 已撤销 |
+| **合计** | | **48/48 ✅** (M2.6 22 项已撤销) | **30-35h(实际 ~4h)** |
 
 执行顺序: M2.7 → M2.1 → M2.2 → (M2.4 / M2.5 并行) → M2.3 → M2.6(全程独立可并行)
 
@@ -248,7 +248,11 @@ Sprint 1 已经把 biocore 升级为可被外部系统调用的微服务(`/api/v
 
 ---
 
-## M2.6 — 原料库 M9(完整,12-15h)
+## M2.6 — 原料库 M9 ~~已撤销~~ (reverted 2026-05-15)
+
+> **状态: 已撤销** — 2026-04-08 ship 完整 22/22 任务, 2026-05-15 由 kris 在 commit `0c573fc refactor(raw-materials): remove M2.6 raw-materials feature` 整体 revert, 理由 "consolidated material handling via recipes" (改走配方内嵌物料路径)。
+>
+> 下方 22 项 [x] 是历史完成记录, 不动以保留 timeline。当前主线已无 raw_materials 相关代码 (migrations/006/raw-materials-routes.ts/web-ui/analysis/raw-materials/components/raw-materials 全部不存在, `grep raw.material packages/*/src` 零命中)。Recipes/Batches 对原 raw_materials 的 FK 是 nullable, 老数据不受影响。
 
 **目的:** 全新的原料/试剂/缓冲液主数据管理模块,带 MSDS PDF 上传、物性曲线编辑、审计、CRUD。
 
