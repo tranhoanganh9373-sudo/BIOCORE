@@ -197,6 +197,23 @@ let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let intentionalDisconnect = false;
 
+// SP-PLC-3 Phase 3c Commit 2 (P3c.2): server connection handshake 时 send
+// {type:'connection.id', clientId}. client 持有 clientId 用于 P3c.4 ack
+// message 协议. localStorage 持久化让重连后保留上次 clientId 作初值,
+// 真正以最新 'connection.id' 为准.
+let clientId: string | null = null;
+const CLIENT_ID_STORAGE_KEY = 'biocore_ws_client_id';
+if (typeof window !== 'undefined') {
+  try {
+    clientId = localStorage.getItem(CLIENT_ID_STORAGE_KEY);
+  } catch { /* SSR / privacy mode → 静默忽略 */ }
+}
+
+/** 测试 / 外部 hook 读当前 clientId. null 表示尚未握手或 server < P3c.2. */
+export function getWsClientId(): string | null {
+  return clientId;
+}
+
 // P0 修复: WebSocket 重连指数退避 (1s → 2s → 4s → ... → 30s 上限) + 最大尝试 20 次
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 20;
@@ -275,6 +292,19 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
         }
       } catch (e) {
         console.error('[WS] Failed to parse message:', e);
+        return;
+      }
+
+      // SP-PLC-3 P3c.2: server connection 握手 → 持久化 clientId. 该 message
+      // 在 channel 路径外 (无 channel 字段), switch 前提前处理 + return.
+      // 老 server (< P3c.2) 不发此 message, clientId 保持 null, 后续依赖
+      // clientId 的 P3c.4 ack 路径降级 (P3c.4 自行处理).
+      if ((msg as any).type === 'connection.id' && typeof (msg as any).clientId === 'string') {
+        const newClientId: string = (msg as any).clientId;
+        clientId = newClientId;
+        if (typeof window !== 'undefined') {
+          try { localStorage.setItem(CLIENT_ID_STORAGE_KEY, newClientId); } catch { /* noop */ }
+        }
         return;
       }
 

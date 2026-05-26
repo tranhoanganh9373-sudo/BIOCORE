@@ -14,22 +14,40 @@
 // 8 tests 覆盖 nature 路径已足.
 // ============================================================
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { WebSocket } from 'ws';
+
+// SP-PLC-3 P3c.2: 本机未 install @msgpack/msgpack + ioredis (CI install 后真包
+// 替换 mock). ws-server.ts top-level import + lib/redis-client.ts 都需要 mock.
+vi.mock('@msgpack/msgpack', () => ({
+  encode: vi.fn((v: unknown) => new Uint8Array(Buffer.from(JSON.stringify(v)))),
+}));
+vi.mock('ioredis', () => ({
+  // P2.3 测试不直接调 Redis, 仅需让 module load 通过.
+  default: class { },
+}));
+
 import {
   handleSubscriptionMessage,
   getSubscriptionState,
   resolveReactorTags,
   buildSubsetPvPayload,
+  __resetSubStatesForTests,
 } from '../../ws-server';
 
 /**
- * 测试用 fake ws — 仅复用 WeakMap key 身份, 不需任何 WebSocket 行为.
- * subStates 是 WeakMap, 类型上限定 WebSocket; 我们 cast 一个 plain 对象通过.
+ * 测试用 fake ws — 不需任何 WebSocket 行为.
+ * SP-PLC-3 P3c.2: subStates 改 Map<clientId>, 每个 fake ws 需独立 clientId.
+ * 这是 fixture 调整, 不破 P2.3 业务语义 (subscribe/unsubscribe/resolve 逻辑).
  */
+let _fakeWsCounter = 0;
 function makeFakeWs(): WebSocket {
-  return {} as WebSocket;
+  _fakeWsCounter += 1;
+  return { clientId: `p2.3-fake-${_fakeWsCounter}` } as unknown as WebSocket;
 }
+beforeEach(() => {
+  __resetSubStatesForTests();
+});
 
 describe('SP-PLC-3 P2.3 — WS 订阅协议', () => {
   // ── Test 1: subscribe 单 tag → state 含该 tag ──

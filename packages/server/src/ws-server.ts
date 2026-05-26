@@ -15,7 +15,7 @@
 // ============================================================
 
 import http from 'http';
-import { timingSafeEqual } from 'crypto';
+import { timingSafeEqual, randomUUID } from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { encode as msgpackEncode } from '@msgpack/msgpack';
 import type Database from 'better-sqlite3';
@@ -23,6 +23,40 @@ import type Database from 'better-sqlite3';
 import { hashApiKey } from './middlewares/auth';
 import type { MqttPublisher } from './mqtt-publisher';
 import { PV_FIELDS } from './engine/realtime-broadcaster';
+import { getRedisClient } from './lib/redis-client';
+
+// ============================================================
+// SP-PLC-3 Phase 3c Commit 2 (P3c.2) — subscription state Redis 镜像
+// ============================================================
+// 计划: docs/plans/SP-PLC-3-tag-cache-phase3c-plan.md  §1 Commit 2
+//
+// 目标: 让 ws subStates 跨 server 可查. 改造点:
+//   - subStates 从 WeakMap<ws, SubscriptionState> 改 Map<clientId,
+//     SubscriptionState>; key 由 connection 期生成的 clientId (uuid).
+//   - 每 connection send back {type:'connection.id', clientId} 让 client 持有.
+//   - subscribe/unsubscribe 处理后异步 mirror 到 Redis hash
+//     `subscriptions:{SERVER_ID}:{clientId}` (field=reactorId, value=tags JSON).
+//   - ws.on('close') 同步 delete Map entry + 异步 redis.del 整 hash.
+//
+// 兼容性:
+//   - 老 client (不发 subscribe) → 无 hash 条目, Phase 1 全推路径不变.
+//   - Redis 不可用 (getRedisClient() === null) → 本地 Map 仍工作, hash noop.
+//   - handleSubscriptionMessage / getSubscriptionState / resolveReactorTags
+//     函数签名不变 (仍接收 ws 参数), 内部读 (ws as any).clientId 查 Map.
+//
+// SERVER_ID 来源 (与 P3c.1 redis-cache-sync.serverId 独立 — 该 handle 在
+// index.ts:3743 异步初始化, 远晚于 createWsServer 同步创建):
+//   - env SERVER_ID 优先 (允许部署期固定 ID 让多实例升级时 hash key 稳定)
+//   - 默认进程启动期 randomUUID, ws-server module 加载即固定
+// 此 ID 与 P3c.1 cacheSyncHandle.serverId 不一定相同 (后者也 default UUID),
+// 实际生产建议两者都用 env SERVER_ID 固定为同值 — 留 P3c.5 deployment doc.
+// ============================================================
+export const WS_SERVER_ID = process.env.SERVER_ID ?? randomUUID();
+
+/** Redis hash key 格式: `subscriptions:{SERVER_ID}:{clientId}`. */
+export function subscriptionHashKey(serverId: string, clientId: string): string {
+  return `subscriptions:${serverId}:${clientId}`;
+}
 
 // ============================================================
 // SP-PLC-3 Phase 2 Commit 3 (P2.3) — WS 客户端订阅协议
@@ -43,11 +77,70 @@ export interface SubscriptionState {
   subs: null | Map<string, Set<string> | '*'>;
 }
 
-const subStates = new WeakMap<WebSocket, SubscriptionState>();
+// SP-PLC-3 P3c.2: 从 WeakMap<ws> 改 Map<clientId>. clientId 在 ws.on('connection')
+// 时生成并写到 (ws as any).clientId, 之后整链 (handleSubscriptionMessage /
+// getSubscriptionState / fan-out) 都按 clientId 查. ws.on('close') 显式 delete
+// (无 GC 自动清理), 同时 redis.del 整 hash.
+const subStates = new Map<string, SubscriptionState>();
+
+/** 仅供测试: 清空 module-scope subStates, 避免跨 it 污染. */
+export function __resetSubStatesForTests(): void {
+  subStates.clear();
+}
+
+/** 从 ws 实例读 clientId. P3c.2 起 createWsServer 在 connection 期注入. */
+function getClientId(ws: WebSocket): string | undefined {
+  return (ws as any).clientId;
+}
 
 /** broadcaster (或测试) 读 ws 的订阅状态. */
 export function getSubscriptionState(ws: WebSocket): SubscriptionState | undefined {
-  return subStates.get(ws);
+  const cid = getClientId(ws);
+  if (!cid) return undefined;
+  return subStates.get(cid);
+}
+
+/**
+ * 序列化 SubscriptionState.subs.get(reactorId) 给 Redis hash field 用.
+ * '*' → 字符串 "*"; Set → JSON array; 其它 → "[]".
+ */
+function serializeReactorTags(value: Set<string> | '*' | undefined): string {
+  if (value === '*') return '*';
+  if (value instanceof Set) return JSON.stringify(Array.from(value));
+  return '[]';
+}
+
+/**
+ * SP-PLC-3 P3c.2: 把 subscribe/unsubscribe 操作的最终 reactor tag 集合
+ * 镜像到 Redis hash. async fire-and-forget — Redis 不可用 (getRedisClient 返
+ * null) 直接 noop; 任何 redis 错误 console.error 吞, 不传回 caller (避免
+ * 把网络抖动暴露给 handleSubscriptionMessage 调用方).
+ *
+ * 设计说明:
+ *   - 每次 subscribe(R, tags) → hset(key, R, serialize(tags))
+ *   - unsubscribe(R, '*' | null) → hdel(key, R)
+ *   - unsubscribe(R, [...]) 减集合, 减空 → hdel(key, R), 否则 hset 覆盖
+ *   - state 删 reactor 后我们 read state 再写, 保证 hash 与 Map 一致
+ */
+function mirrorSubscribeToRedis(
+  clientId: string,
+  reactorId: string,
+  state: SubscriptionState,
+): void {
+  const redis = getRedisClient();
+  if (!redis) return;
+  const key = subscriptionHashKey(WS_SERVER_ID, clientId);
+  const existing = state.subs?.get(reactorId);
+  if (existing === undefined) {
+    // reactor 已从 Map 删 (e.g. unsubscribe 把集合减空)
+    redis.hdel(key, reactorId).catch((err: Error) => {
+      console.error(`[ws-server] redis.hdel ${key} ${reactorId} failed:`, err.message);
+    });
+    return;
+  }
+  redis.hset(key, reactorId, serializeReactorTags(existing)).catch((err: Error) => {
+    console.error(`[ws-server] redis.hset ${key} ${reactorId} failed:`, err.message);
+  });
 }
 
 /**
@@ -56,24 +149,32 @@ export function getSubscriptionState(ws: WebSocket): SubscriptionState | undefin
  *
  * 返回:
  *   - true: 消息合法已应用
- *   - false: 消息非法 (缺字段 / 类型错) — 静默忽略 (不抛, 不 close)
+ *   - false: 消息非法 (缺字段 / 类型错 / 缺 clientId) — 静默忽略 (不抛, 不 close)
+ *
+ * SP-PLC-3 P3c.2: 函数签名不变 (兼容 P2.3 测试). 内部读 (ws as any).clientId,
+ * 缺 clientId → 返 false (老调用者忘了在 connection 期注入 → 静默忽略, 与原
+ * "非法 message" 路径一致). 同时把成功操作 mirror 到 Redis hash.
  */
 export function handleSubscriptionMessage(ws: WebSocket, msg: any): boolean {
   if (!msg || typeof msg !== 'object') return false;
   if (msg.type !== 'subscribe' && msg.type !== 'unsubscribe') return false;
   if (typeof msg.reactorId !== 'string' || !msg.reactorId) return false;
 
-  let state = subStates.get(ws);
+  const clientId = getClientId(ws);
+  if (!clientId) return false;
+
+  let state = subStates.get(clientId);
 
   if (msg.type === 'subscribe') {
     if (!state) {
       state = { subs: new Map() };
-      subStates.set(ws, state);
+      subStates.set(clientId, state);
     }
     if (!state.subs) state.subs = new Map();
     const tagSet: Set<string> | '*' =
       msg.tags === '*' ? '*' : Array.isArray(msg.tags) ? new Set(msg.tags) : new Set();
     state.subs.set(msg.reactorId, tagSet);
+    mirrorSubscribeToRedis(clientId, msg.reactorId, state);
     return true;
   }
 
@@ -91,6 +192,7 @@ export function handleSubscriptionMessage(ws: WebSocket, msg: any): boolean {
       if (existing.size === 0) state.subs.delete(msg.reactorId);
     }
   }
+  mirrorSubscribeToRedis(clientId, msg.reactorId, state);
   return true;
 }
 
@@ -290,7 +392,10 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
 
       let payloadToSend: string | Uint8Array;
       if (useFilter) {
-        const state = subStates.get(client);
+        // SP-PLC-3 P3c.2: subStates 改 Map<clientId>, fan-out 按 clientId 查.
+        // 老 client (无 clientId, 不应发生因 connection 期总会注入, 防御性兼容)
+        // → state=undefined → resolveReactorTags 返 null → 全推.
+        const state = getSubscriptionState(client);
         const resolved = resolveReactorTags(state, reactorId as string);
         if (resolved === null) {
           // 老 client — 全推 (Phase 1 兼容)
@@ -388,7 +493,18 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
     // WS_WIRE_MODE_FORCED=json 强制全 client JSON (hot-rollback).
     (ws as any).wireMode = resolveWireMode(req.url, req.headers.host);
 
-    console.log(`[${new Date().toISOString()}] [INFO] [WS] 客户端连接 user=${user.user_id} wire=${(ws as any).wireMode} from=${remoteIp} (总数: ${wss.clients.size})`);
+    // SP-PLC-3 P3c.2: 生成 clientId 并 send back 给 client. clientId 是
+    // subStates Map / Redis hash key 的 key, 也是后续 ack message (P3c.4) 用.
+    // send 失败 (ws 已 close) try/catch 吞, 不阻塞 connection handler.
+    const clientId = randomUUID();
+    (ws as any).clientId = clientId;
+    try {
+      ws.send(JSON.stringify({ type: 'connection.id', clientId }));
+    } catch (e) {
+      console.warn(`[WS] send connection.id failed for ${clientId}: ${(e as Error).message}`);
+    }
+
+    console.log(`[${new Date().toISOString()}] [INFO] [WS] 客户端连接 user=${user.user_id} clientId=${clientId} wire=${(ws as any).wireMode} from=${remoteIp} (总数: ${wss.clients.size})`);
 
     // SP-PLC-3 P2.3: 处理客户端 subscribe / unsubscribe message. 不合法消息
     // (parse 失败 / type 不识别) 静默忽略 — 不抛, 不 close, 兼容老 client (它们
@@ -407,10 +523,18 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
     });
 
     ws.on('close', () => {
-      // SP-PLC-3 P2.3: WeakMap 兜底删除 — ws GC 后 entry 自动消失,
-      // 但显式 delete 让生命周期可见 (plan §2a 双保).
-      subStates.delete(ws);
-      console.log(`[${new Date().toISOString()}] [INFO] [WS] 客户端断开 user=${user.user_id} (剩余: ${wss.clients.size})`);
+      // SP-PLC-3 P3c.2: subStates 是 Map<clientId>, 显式删 entry (无 GC
+      // 自动清理 — 不删 → 内存泄漏). 同时 redis.del 整 hash 让跨 server
+      // query 不会看到僵尸 subscription (异步, 错误吞).
+      subStates.delete(clientId);
+      const redis = getRedisClient();
+      if (redis) {
+        const key = subscriptionHashKey(WS_SERVER_ID, clientId);
+        redis.del(key).catch((err: Error) => {
+          console.error(`[ws-server] redis.del ${key} failed:`, err.message);
+        });
+      }
+      console.log(`[${new Date().toISOString()}] [INFO] [WS] 客户端断开 user=${user.user_id} clientId=${clientId} (剩余: ${wss.clients.size})`);
     });
   });
 
