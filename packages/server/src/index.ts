@@ -3332,6 +3332,8 @@ const stopBroadcaster = startRealtimeBroadcaster({
   },
   // SP-PLC-3 P2.5: back-pressure skip 累计到 cache-metrics.
   onSkip: (reason) => cacheMetrics.skippedTotal.inc({ reason }),
+  // SP-PLC-3 P3a.2: 每 tick 真做 fan-out 时上报总耗时秒到 Histogram.
+  onFanout: (elapsedSeconds) => cacheMetrics.fanoutHistogram.observe(elapsedSeconds),
 });
 
 const stopFlusher = startInfluxFlusher({

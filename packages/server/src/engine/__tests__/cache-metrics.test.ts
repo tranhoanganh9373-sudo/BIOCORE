@@ -166,3 +166,94 @@ describe('SP-PLC-3 P2.5 — registerCacheMetrics', () => {
     h2.stop();
   });
 });
+
+// ============================================================
+// SP-PLC-3 Phase 3a Commit 2 (P3a.2) — broadcaster fan-out latency Histogram
+// 计划: docs/plans/SP-PLC-3-tag-cache-phase3a-plan.md  §1 Commit 2
+// ============================================================
+//
+// 覆盖 (与 plan §1 Commit 2 spec 完全一致):
+//   1. fan-out 调用后 histogram count 增 1 (observe 0.005s → 0.01 桶 +1)
+//   2. 大 batch (100 reactor) fan-out latency 入桶 (observe 0.5s → ≤0.5 桶 +1, 不超 5s)
+//   3. 0 dirty (空 tick) 不 observe (无人调 .observe → count 仍 0)
+//
+// 注: 这 3 项是 cache-metrics handle 侧的 Histogram 行为验证, 用 fanoutHistogram
+// 直接 observe 模拟 broadcaster.onFanout 回调. broadcaster 端 onFanout 仅在
+// reactorsToFlush.length>=1 时调一次的契约由 realtime-broadcaster.ts 早返保证.
+// ============================================================
+
+describe('SP-PLC-3 P3a.2 — fanoutHistogram (broadcaster fan-out latency)', () => {
+  let cache: TagCache;
+  let registry: MetricsRegistry;
+
+  beforeEach(() => {
+    cache = new TagCache();
+    registry = new MetricsRegistry();
+  });
+
+  // 1. fan-out 调用后 histogram count 增 1, 且 0.01 桶 +1
+  it('observe 0.005s → count=1 sum=0.005 且 0.01 / 0.05 / ... 全桶各 +1', () => {
+    const h = registerCacheMetrics({ registry, tagCache: cache, reactorIds: () => [] });
+
+    // 模拟 broadcaster.onFanout(0.005) 一次, 即 5ms fan-out 完成
+    h.fanoutHistogram.observe(0.005);
+
+    const snap = h.fanoutHistogram.snapshot();
+    expect(snap.count).toBe(1);
+    expect(snap.sum).toBeCloseTo(0.005, 6);
+    // 0.005 ≤ 0.01 → 全部 ≥0.01 的桶累积都 +1 (services/metrics Histogram 语义)
+    expect(snap.buckets[0.01]).toBe(1);
+    expect(snap.buckets[0.05]).toBe(1);
+    expect(snap.buckets[0.1]).toBe(1);
+    expect(snap.buckets[0.5]).toBe(1);
+    expect(snap.buckets[1]).toBe(1);
+    expect(snap.buckets[5]).toBe(1);
+
+    // Prometheus 序列化含本 metric (8 行: 6 buckets + +Inf + sum + count)
+    const out = registry.serialize();
+    expect(out).toContain('# HELP biocore_broadcaster_fanout_seconds');
+    expect(out).toContain('# TYPE biocore_broadcaster_fanout_seconds histogram');
+    expect(out).toContain('biocore_broadcaster_fanout_seconds_count 1');
+
+    h.stop();
+  });
+
+  // 2. 大 batch (100 reactor) fan-out latency 入桶 (~0.5s), 不超 5s 上限
+  it('大 batch fan-out 0.5s observe → ≤0.5 桶各 +1, ≤0.1 桶不增', () => {
+    const h = registerCacheMetrics({ registry, tagCache: cache, reactorIds: () => [] });
+
+    // 模拟 100 reactor 大 fan-out, 总耗时 0.5s (上限边界)
+    h.fanoutHistogram.observe(0.5);
+
+    const snap = h.fanoutHistogram.snapshot();
+    expect(snap.count).toBe(1);
+    expect(snap.sum).toBeCloseTo(0.5, 6);
+    // 0.5 ≤ 0.5 = true → 0.5 桶 +1; 但 > 0.1 → 0.01/0.05/0.1 桶不增
+    expect(snap.buckets[0.01]).toBe(0);
+    expect(snap.buckets[0.05]).toBe(0);
+    expect(snap.buckets[0.1]).toBe(0);
+    expect(snap.buckets[0.5]).toBe(1);
+    expect(snap.buckets[1]).toBe(1);
+    expect(snap.buckets[5]).toBe(1);
+    // 0.5s 远低于 5s 上限, 不应丢失 (无 +Inf 桶溢出)
+
+    h.stop();
+  });
+
+  // 3. 0 dirty 空 tick 不 observe — fanoutHistogram 在无人调时 count 保持 0
+  it('0 dirty 空 tick 不 observe: 从未调 fanoutHistogram.observe → count=0 sum=0', () => {
+    const h = registerCacheMetrics({ registry, tagCache: cache, reactorIds: () => [] });
+
+    // 注: broadcaster 端 (realtime-broadcaster.ts tick) 的 dirtyQueue.size===0
+    // 早返契约保证 onFanout 不被调用; 此处从 cache-metrics handle 视角验证
+    // "无人调 observe → Histogram 状态保持初值".
+    const snap = h.fanoutHistogram.snapshot();
+    expect(snap.count).toBe(0);
+    expect(snap.sum).toBe(0);
+    for (const bound of [0.01, 0.05, 0.1, 0.5, 1, 5]) {
+      expect(snap.buckets[bound]).toBe(0);
+    }
+
+    h.stop();
+  });
+});

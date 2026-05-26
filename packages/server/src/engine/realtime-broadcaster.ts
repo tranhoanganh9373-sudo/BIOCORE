@@ -63,6 +63,13 @@ export interface BroadcasterDeps {
    * 不传 → 行为不变 (老 wiring 兼容).
    */
   onSkip?: (reason: 'back-pressure') => void;
+  /**
+   * SP-PLC-3 P3a.2: 可选 fan-out 延迟回调. 仅在 tick 真做 fan-out
+   * (dirtyQueue.size>0) 时, 在 reactor 循环外整体 wrap performance.now() 后调一次
+   * elapsedSeconds 入参. 0-dirty 空 tick 不调 (避免噪声入桶). 用于 cache-metrics
+   * 累计 biocore_broadcaster_fanout_seconds Histogram. 不传 → 行为不变.
+   */
+  onFanout?: (elapsedSeconds: number) => void;
 }
 
 /**
@@ -135,6 +142,10 @@ export function startRealtimeBroadcaster(deps: BroadcasterDeps): () => void {
     const reactorsToFlush = Array.from(dirtyQueue.keys());
     dirtyQueue.clear();
 
+    // SP-PLC-3 P3a.2: 仅在真有 fan-out 时计时 (空 tick 已早返,
+    // 此处 reactorsToFlush.length >= 1). performance.now() 单位 ms, 转秒上报.
+    const fanoutStart = performance.now();
+
     for (const reactorId of reactorsToFlush) {
       try {
         // back-pressure 检查: 任一 client bufferedAmount 超阈 → 整个 reactor skip
@@ -181,6 +192,15 @@ export function startRealtimeBroadcaster(deps: BroadcasterDeps): () => void {
           `[${new Date().toISOString()}] [ERROR] [broadcaster] reactor=${reactorId} tick failed:`,
           (err as Error).message,
         );
+      }
+    }
+
+    // SP-PLC-3 P3a.2: 全 reactor fan-out 完成, observe 总耗时 (ms → s).
+    // try/catch 隔离: callback 抛错不影响下次 tick.
+    if (deps.onFanout) {
+      const elapsedSeconds = (performance.now() - fanoutStart) / 1000;
+      try { deps.onFanout(elapsedSeconds); } catch (e) {
+        console.error(`[${new Date().toISOString()}] [ERROR] [broadcaster] onFanout callback threw:`, (e as Error).message);
       }
     }
   };

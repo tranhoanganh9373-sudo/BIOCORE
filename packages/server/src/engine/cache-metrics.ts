@@ -12,6 +12,10 @@
 //       handle.skippedTotal 注入 broadcaster.onSkip / createWsServer.onSkip
 //       (reason='back-pressure' | 'no-subscription'). cache-metrics 仅
 //       注册指标, 不直接订阅 broadcaster — 解耦, 测试也更直白.
+//   - biocore_broadcaster_fanout_seconds             Histogram (SP-PLC-3 P3a.2),
+//       broadcaster tick 在真正 fan-out 整段 wrap performance.now() 后回调
+//       (deps.onFanout) 显式 observe; 0 dirty 空 tick 不 observe. 无 label
+//       (Phase 3a Q(iii) 决策, 避免 reactor 数量增长导致桶 cardinality 爆).
 //
 // 设计抉择 (writes_total 计数路径):
 //   - 不动 P1 TagCache (未加 onWrite hook): 保 SP-PLC-3 Phase 1 模块表面
@@ -29,7 +33,7 @@
 //     清 metric 本身 (metric 是全局单例, 不需要也不应清).
 // ============================================================
 
-import type { Counter, Gauge, MetricsRegistry } from '../services/metrics';
+import type { Counter, Gauge, Histogram, MetricsRegistry } from '../services/metrics';
 import type { TagCache } from './tag-cache';
 
 /** 30 秒一次, 把 TagCache 当前 size 写入 Gauge. 不宜过频, size 是慢变量. */
@@ -64,6 +68,14 @@ export interface CacheMetricsHandle {
    * `(reason) => handle.skippedTotal.inc({ reason })` 注入累计逻辑.
    */
   skippedTotal: Counter;
+  /**
+   * SP-PLC-3 P3a.2: broadcaster fan-out 延迟 Histogram (秒).
+   * Caller 在 broadcaster.onFanout 中调
+   * `(elapsedSeconds) => handle.fanoutHistogram.observe(elapsedSeconds)` 注入.
+   * 无 label (避免 reactor 数量增长导致桶 cardinality 爆), 单一全局 Histogram.
+   * Buckets 复用 services/metrics 固定 `[0.01, 0.05, 0.1, 0.5, 1, 5]` 秒.
+   */
+  fanoutHistogram: Histogram;
   /** 停止采样 / 解订阅. 重复调用安全. */
   stop: () => void;
 }
@@ -96,6 +108,11 @@ export function registerCacheMetrics(deps: CacheMetricsDeps): CacheMetricsHandle
   const skippedTotal = deps.registry.counter(
     'biocore_broadcaster_skipped_total',
     'Broadcaster fan-out skipped due to back-pressure or no-subscription',
+  );
+  // SP-PLC-3 P3a.2: 无 label Histogram, buckets 由 services/metrics 统一固定.
+  const fanoutHistogram = deps.registry.histogram(
+    'biocore_broadcaster_fanout_seconds',
+    'Broadcaster tick fan-out latency in seconds (cache change → all client fan-out completed)',
   );
 
   // 接 TagCache fan-out (callback 仅在 sameValue=false 时触发, 即 deadband 通过).
@@ -141,5 +158,5 @@ export function registerCacheMetrics(deps: CacheMetricsDeps): CacheMetricsHandle
     deps.tagCache.unsubscribe(subId);
   };
 
-  return { writesTotal, sizeGauge, dirtyTotal, skippedTotal, stop };
+  return { writesTotal, sizeGauge, dirtyTotal, skippedTotal, fanoutHistogram, stop };
 }
