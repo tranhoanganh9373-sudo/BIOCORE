@@ -1,6 +1,6 @@
 # SP-PLC-3 Tag Cache & OPC-style Subscription — Phase 1 实施计划
 
-**Status:** Shipped 2026-05-25 (P1=91a6ee8, P2=bb7eeb2, P3=8f5007e, P4=pending). Phase 1 完成. (P4 commit hash 待 commit 后由调用方手动填回此字段.)
+**Status:** Shipped 2026-05-25 (P1=91a6ee8, P2=bb7eeb2, P3=8f5007e, P4=6d58163). Phase 1 完成.
 **Target version:** v1.15.0
 **Estimated:** ~700 LOC, 4 commits, +35–40 tests, 6–8h single-engineer
 **Scope tier:** Phase 1 (3000 点门槛). Phase 2/3 (5000+ / 10000+) 留作后续 sprint, 见 §9.
