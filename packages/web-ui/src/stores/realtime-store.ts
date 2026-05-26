@@ -566,6 +566,36 @@ export function sendWsMessage(msg: object): void {
   ws.send(JSON.stringify(msg));
 }
 
+// ============================================================
+// SP-PLC-3 Phase 2 Commit 3 (P2.3) — WS 客户端订阅 helper
+// ============================================================
+// useTag / useTagHistory mount 时调 sendSubscribe(reactorId, [tag]),
+// unmount 时调 sendUnsubscribe. 服务端按订阅集合 fan-out, 非订阅 reactor 不推
+// → 多页签 / 多 dashboard 下显著降低单 client 流量.
+//
+// 与 sendWsMessage 不同, 这两个 helper **silent return** if WS 未 open
+// (mount 时 ws.onopen 可能未触发, 重连期间也可能 transient closed) — 不抛,
+// 不影响 hook lifecycle. 重连成功后 wsConnected store 字段 onopen 翻 true,
+// 触发 useTag effect (依赖 wsConnected) 重新走一次 sendSubscribe, 自动补发.
+// ============================================================
+export function sendSubscribe(reactorId: string, tags: string[] | '*'): void {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(JSON.stringify({ type: 'subscribe', reactorId, tags }));
+  } catch {
+    // half-closed / send buffer 满 — 静默, server 端老 client 全推路径仍工作
+  }
+}
+
+export function sendUnsubscribe(reactorId: string, tags: string[] | '*' = '*'): void {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try {
+    ws.send(JSON.stringify({ type: 'unsubscribe', reactorId, tags }));
+  } catch {
+    // 同上
+  }
+}
+
 // SP-FX-2: test-only hooks. Not used in production.
 export const __testHooks = {
   __resetWsForTests(): void { ws = null; },

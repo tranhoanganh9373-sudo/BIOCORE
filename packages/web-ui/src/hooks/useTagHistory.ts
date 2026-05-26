@@ -1,5 +1,6 @@
-import { useRealtimeStore } from '@/stores/realtime-store';
-import { parseTagId } from './useTag';
+import { useEffect } from 'react';
+import { useRealtimeStore, sendSubscribe, sendUnsubscribe } from '@/stores/realtime-store';
+import { parseTagId, tagForField } from './useTag';
 
 export interface UseTagHistoryOpts {
   windowSec?: number;
@@ -37,6 +38,20 @@ export function useTagHistory(tagId: string, opts: UseTagHistoryOpts = {}): TagH
   const reactorData = useRealtimeStore((s) =>
     parsed ? s.reactorData[parsed.reactorId] : undefined
   );
+
+  // SP-PLC-3 P2.3: mount 时自动订阅对应 PLC tag (与 useTag 共用 FIELD_TO_TAG
+  // 全 19 字段表, 复用 tagForField helper). 与 useTag 区别: useTagHistory
+  // 仅 trend 用 (5 字段), 但订阅协议按 PLC tag 全集走 — server fan-out
+  // 不区分 trend / 非 trend 字段, 字段无映射 (例: temp_mode) 不订阅, 与 useTag 同语义.
+  const reactorIdForSub = parsed?.reactorId;
+  const plcTagForSub = parsed?.field ? tagForField(parsed.field) : undefined;
+  useEffect(() => {
+    if (!reactorIdForSub || !plcTagForSub) return;
+    sendSubscribe(reactorIdForSub, [plcTagForSub]);
+    return () => {
+      sendUnsubscribe(reactorIdForSub, [plcTagForSub]);
+    };
+  }, [reactorIdForSub, plcTagForSub, wsConnected]);
 
   if (!parsed) return EMPTY_HISTORY;
   if (!reactorData) return EMPTY_HISTORY;

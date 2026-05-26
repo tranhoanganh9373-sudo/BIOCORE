@@ -1,6 +1,24 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
-import { useRealtimeStore, createTrendBuffer } from '@/stores/realtime-store';
+
+// SP-PLC-3 P2.3: 把 sendSubscribe / sendUnsubscribe stub 成 vi.fn 以便断言
+// mount/unmount 调用. 其它 store export (useRealtimeStore, createTrendBuffer,
+// sendWsMessage, __testHooks) 全保留真身.
+vi.mock('@/stores/realtime-store', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/stores/realtime-store')>();
+  return {
+    ...actual,
+    sendSubscribe: vi.fn(),
+    sendUnsubscribe: vi.fn(),
+  };
+});
+
+import {
+  useRealtimeStore,
+  createTrendBuffer,
+  sendSubscribe,
+  sendUnsubscribe,
+} from '@/stores/realtime-store';
 import { useTag } from '../useTag';
 
 function resetStore() {
@@ -65,6 +83,9 @@ describe('useTag', () => {
   beforeEach(() => {
     resetStore();
     vi.useFakeTimers();
+    // SP-PLC-3 P2.3: 每 test 清 subscribe/unsubscribe call records
+    (sendSubscribe as ReturnType<typeof vi.fn>).mockClear();
+    (sendUnsubscribe as ReturnType<typeof vi.fn>).mockClear();
   });
 
   afterEach(() => {
@@ -254,5 +275,51 @@ describe('useTag', () => {
     const { result } = renderHook(() => useTag('F01.AI-1'));
     expect(result.current.value).toBe(22.3);
     expect(result.current.quality).toBeUndefined();
+  });
+
+  // ============================================================
+  // SP-PLC-3 Phase 2 Commit 3 (P2.3) — 自动订阅 lifecycle (3 tests)
+  // ============================================================
+
+  it('15. mount → sendSubscribe(reactorId, [plcTag]) 调一次', () => {
+    seedReactor({ processValues: null });
+    renderHook(() => useTag('F01.AI-2'));
+    expect(sendSubscribe).toHaveBeenCalledTimes(1);
+    expect(sendSubscribe).toHaveBeenCalledWith('F01', ['PH_PV']);
+    expect(sendUnsubscribe).not.toHaveBeenCalled();
+  });
+
+  it('16. unmount → sendUnsubscribe(reactorId, [plcTag]) 调一次', () => {
+    seedReactor({ processValues: null });
+    const { unmount } = renderHook(() => useTag('F01.AI-0'));
+    expect(sendSubscribe).toHaveBeenCalledWith('F01', ['TEMP_PV']);
+    unmount();
+    expect(sendUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(sendUnsubscribe).toHaveBeenCalledWith('F01', ['TEMP_PV']);
+  });
+
+  it('17. tagId 切换 → 旧 tag unsubscribe + 新 tag subscribe (无映射 field 不调)', () => {
+    seedReactor({ processValues: null });
+    const { rerender, unmount } = renderHook(({ tagId }) => useTag(tagId), {
+      initialProps: { tagId: 'F01.AI-0' },
+    });
+    expect(sendSubscribe).toHaveBeenCalledWith('F01', ['TEMP_PV']);
+    expect(sendSubscribe).toHaveBeenCalledTimes(1);
+
+    // 切到不同 field 同 reactor
+    rerender({ tagId: 'F01.AI-2' });
+    // 旧 effect cleanup → unsubscribe('TEMP_PV'); 新 effect → subscribe('PH_PV')
+    expect(sendUnsubscribe).toHaveBeenCalledWith('F01', ['TEMP_PV']);
+    expect(sendSubscribe).toHaveBeenCalledWith('F01', ['PH_PV']);
+
+    // 切到无映射的 field (temp_mode 不在 FIELD_TO_TAG) → 不发新 subscribe
+    const subCallsBefore = (sendSubscribe as ReturnType<typeof vi.fn>).mock.calls.length;
+    rerender({ tagId: 'F01.temp_mode' });
+    expect(sendUnsubscribe).toHaveBeenCalledWith('F01', ['PH_PV']); // 旧 PH_PV cleanup
+    expect((sendSubscribe as ReturnType<typeof vi.fn>).mock.calls.length).toBe(subCallsBefore);
+
+    unmount(); // temp_mode 没注册订阅, unmount 时也不该再 unsubscribe
+    // 总 unsubscribe 调用 = TEMP_PV + PH_PV = 2 次
+    expect(sendUnsubscribe).toHaveBeenCalledTimes(2);
   });
 });

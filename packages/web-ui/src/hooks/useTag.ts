@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useRealtimeStore } from '@/stores/realtime-store';
+import { useRealtimeStore, sendSubscribe, sendUnsubscribe } from '@/stores/realtime-store';
 
 export interface UseTagOpts {
   staleMs?: number;
@@ -52,6 +52,44 @@ const FIELD_TO_QUALITY_TAG: Record<string, string> = {
   rpm: 'VFD_ACTUAL_FREQ',
 };
 
+/**
+ * SP-PLC-3 P2.3: ProcessValues field → PLC tag 全 19 字段映射. 与
+ * server `realtime-broadcaster.PV_FIELDS` 严格一一对应. 用于 useTag
+ * mount 时按 field 反查 tag 发 sendSubscribe.
+ *
+ * 与 FIELD_TO_QUALITY_TAG 区别: 后者是 Patch A 保守暴露范围 (仅 5 字段
+ * 在 UI 公开 quality), 本表是 **订阅协议** 的完整映射 — 任何 PV field
+ * 的 useTag 都该订阅, 否则 server 端 fan-out 会跳过该 tag → UI 看不到值.
+ *
+ * temp_mode 不在 PV_FIELDS 内 (payload 有但是常量 2), 无 PLC tag, 不订阅.
+ */
+const FIELD_TO_TAG: Record<string, string> = {
+  'AI-0': 'TEMP_PV',
+  'AI-1': 'JACKET_PV',
+  'AI-2': 'PH_PV',
+  'AI-3': 'DO_PV',
+  'AI-4': 'PRESSURE_PV',
+  'AI-5': 'AIRFLOW_PV',
+  'AI-6': 'WEIGHT_PV',
+  rpm: 'VFD_ACTUAL_FREQ',
+  vfd_current: 'VFD_CURRENT',
+  'AO-0_cv': 'STEAM_CV',
+  'AO-1_cv': 'COOL_CV',
+  'AO-2_cv': 'AIR_CV',
+  P01_rate: 'P01_RATE',
+  P02_rate: 'P02_RATE',
+  P03_rate: 'P03_RATE',
+  P04_rate: 'P04_RATE',
+  temp_sv: 'TEMP_SV',
+  pH_sv: 'PH_SV',
+  DO_sv: 'DO_SV',
+};
+
+/** 给 useTagHistory 复用 (避免双源真相). */
+export function tagForField(field: string): string | undefined {
+  return FIELD_TO_TAG[field];
+}
+
 export function parseTagId(tagId: string): ParsedTagId | null {
   if (typeof tagId !== 'string') return null;
   const parts = tagId.split('.');
@@ -90,6 +128,25 @@ export function useTag(tagId: string, opts: UseTagOpts = {}): TagSnapshot {
   const reactorData = useRealtimeStore((s) =>
     parsed ? s.reactorData[parsed.reactorId] : undefined
   );
+
+  // SP-PLC-3 P2.3: mount 时按 (reactorId, plcTag) 自动 sendSubscribe,
+  // unmount 时 sendUnsubscribe. WS 未 open 时 helper 静默不发 (会被重连后的
+  // wsConnected → true 触发的 effect re-run 自动补发).
+  //
+  // 依赖 [parsed?.reactorId, parsed?.field, wsConnected] —
+  //   - tagId 变 (reactor / field 切换) → 取消旧订阅, 发新订阅
+  //   - wsConnected 从 false → true (重连后) → 补发订阅
+  //   - 服务端 SubscriptionState 是 Set 自动去重, idempotent 安全
+  const reactorIdForSub = parsed?.reactorId;
+  const fieldForSub = parsed?.field;
+  const plcTagForSub = fieldForSub ? FIELD_TO_TAG[fieldForSub] : undefined;
+  useEffect(() => {
+    if (!reactorIdForSub || !plcTagForSub) return;
+    sendSubscribe(reactorIdForSub, [plcTagForSub]);
+    return () => {
+      sendUnsubscribe(reactorIdForSub, [plcTagForSub]);
+    };
+  }, [reactorIdForSub, plcTagForSub, wsConnected]);
 
   if (!parsed) return STALE_SNAPSHOT;
   if (!reactorData || !reactorData.processValues) return STALE_SNAPSHOT;

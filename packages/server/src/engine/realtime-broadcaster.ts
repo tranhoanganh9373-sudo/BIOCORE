@@ -65,7 +65,9 @@ export interface BroadcasterDeps {
  * `transform` 函数对单个 tag value 做必要变换 (例如 VFD_ACTUAL_FREQ × 24
  * → rpm 整数). undefined 表示直传.
  */
-const PV_FIELDS: ReadonlyArray<{ field: string; tag: string; transform?: (v: number) => number }> = [
+// SP-PLC-3 P2.3: export 让 ws-server.buildSubsetPvPayload 复用 (反向 tag→field 查表).
+// 仅 export, 行为不变.
+export const PV_FIELDS: ReadonlyArray<{ field: string; tag: string; transform?: (v: number) => number }> = [
   { field: 'AI-0', tag: 'TEMP_PV' },          // 罐温
   { field: 'AI-1', tag: 'JACKET_PV' },        // 夹套温度
   { field: 'AI-2', tag: 'PH_PV' },            // pH
