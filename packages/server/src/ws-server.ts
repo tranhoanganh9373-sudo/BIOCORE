@@ -24,6 +24,7 @@ import { hashApiKey } from './middlewares/auth';
 import type { MqttPublisher } from './mqtt-publisher';
 import { PV_FIELDS } from './engine/realtime-broadcaster';
 import { getRedisClient } from './lib/redis-client';
+import { CRITICAL_CHANNELS, enqueueCriticalMessage } from './engine/ws-message-queue';
 
 // ============================================================
 // SP-PLC-3 Phase 3c Commit 2 (P3c.2) — subscription state Redis 镜像
@@ -335,10 +336,21 @@ export interface CreateWsServerOptions {
    * 不传 → 行为不变 (老 wiring 兼容).
    */
   onSkip?: (reason: 'no-subscription') => void;
+  /**
+   * SP-PLC-3 P3c.3: 可选 critical channel 入队回调. 注入时所有 channel ∈
+   * CRITICAL_CHANNELS ('alarm' | 'state_update' | 'recipe_downloaded') 的
+   * broadcast 走 ws_message_queue 可靠投递 (per-client per-message enqueue);
+   * 不注入 → critical 退化为现有全推路径 (Phase 2 行为, 向后兼容).
+   *
+   * 函数签名只暴露 enqueueWsMessage 单方法 (避免拉整 SQLiteService 类型),
+   * 与 engine/ws-message-queue.ts 的 WsQueueSqliteShape 子集兼容. 实际接通
+   * 在 P3c.5 server 启动期: opts.enqueueWsMessage = (e) => sqlite.enqueueWsMessage(e).
+   */
+  enqueueWsMessage?: (entry: { client_id: string; channel: string; payload: any }) => number;
 }
 
 export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
-  const { server, sqlite, verifyJWT, authEnabled, mqttPublisher, onSkip } = opts;
+  const { server, sqlite, verifyJWT, authEnabled, mqttPublisher, onSkip, enqueueWsMessage } = opts;
 
   const wss = new WebSocketServer({ server, path: '/ws' });
 
@@ -359,6 +371,40 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
       reactor_id: reactorId ?? null,
       payload,
     };
+
+    // SP-PLC-3 P3c.3: critical channel (alarm/state_update/recipe_downloaded)
+    // 走 ws_message_queue 可靠投递. per-online-client per-message 入队 →
+    // dispatcher tick 真正 ws.send + ack 跟踪 (P3c.4). 入队后直接 return,
+    // 不走下方 fan-out 路径 (避免重复发送). MQTT mirror 已在前面发出 (critical
+    // channel 通常需要审计, MQTT 镜像保留独立路径).
+    //
+    // 不变量:
+    //   - opts.enqueueWsMessage 未注入 (P3c.5 之前 / hot-rollback) → critical
+    //     仍走全推路径 (Phase 2 行为, 兼容性优先).
+    //   - critical 不参与 wireMode (msgpack/json) — dispatcher 统一 JSON 字符串.
+    //     P3c.4 引入 msg_id 后仍 JSON, msgpack 优化留 Phase 3d.
+    //   - per-client envelope 含整 channel + payload (与 fan-out 路径 envelope
+    //     结构对齐), batch_id/reactor_id/timestamp 字段暂未入队 — caller 业务
+    //     通常已嵌在 payload 内 (e.g. alarm.batch_id), P3c.3 不引入字段冗余.
+    if (enqueueWsMessage && CRITICAL_CHANNELS.has(channel)) {
+      wss.clients.forEach((client) => {
+        if (client.readyState !== WebSocket.OPEN) return;
+        const cid = (client as any).clientId;
+        if (typeof cid !== 'string' || !cid) return; // 老 client 无 clientId → skip queue
+        try {
+          enqueueCriticalMessage(
+            { enqueueWsMessage },
+            cid,
+            channel,
+            payload,
+          );
+        } catch (e) {
+          // 入队失败 (sqlite 异常) — 不冒泡到 EventEmitter caller, console.warn 留痕
+          console.warn(`[WS] critical channel enqueue 失败 channel=${channel} cid=${cid}: ${(e as Error).message}`);
+        }
+      });
+      return;
+    }
 
     // SP-PLC-3 P3a.1: per-tick serializer cache. 同 envelope 推 N 个 client
     // 时一次 encode 一次 stringify (lazy), 避免每 client 重复. mixed clients

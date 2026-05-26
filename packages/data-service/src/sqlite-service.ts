@@ -468,6 +468,81 @@ export class SQLiteService {
     return r.changes > 0;
   }
 
+  // ─── SP-PLC-3 P3c.3: ws_message_queue (reliable queue for critical WS) ───
+  //
+  // 复用上方 ai_suggestions dispatch_status state machine 的 6-method 模板
+  // (claimPending / markDelivered / markFailed / incrementRetry /
+  // rollbackInProgress + enqueue 入口). dispatcher 见
+  // packages/server/src/engine/ws-message-queue.ts.
+  //
+  // 不变量:
+  //   - status ∈ {'pending','dispatching','delivered','failed'}
+  //   - 入队 status='pending' retry_count=0; dispatcher claim 把 batch 改
+  //     'dispatching' (transaction 内); send 成功 → 'delivered' + delivered_at;
+  //     send 失败 → incrementRetry 回 'pending' (retry_count++); 达上限 →
+  //     'failed' (terminal, 不再 claim).
+  //   - server 启动期 rollbackInProgressWsMessages() 把崩溃前残留的
+  //     'dispatching' 复位为 'pending' (与 scada-write-dispatcher 同模式).
+
+  /** 入队一条 critical WS 消息. payload 自动 JSON.stringify. 返回新 row id. */
+  enqueueWsMessage(entry: { client_id: string; channel: string; payload: any }): number {
+    const result = this.db.prepare(`
+      INSERT INTO ws_message_queue (client_id, channel, payload, status, retry_count)
+      VALUES (?, ?, ?, 'pending', 0)
+    `).run(entry.client_id, entry.channel, JSON.stringify(entry.payload));
+    return Number(result.lastInsertRowid);
+  }
+
+  /**
+   * 原子声明一批 pending 消息: 取 limit 行最早入队 row, 状态改 'dispatching'
+   * 返回原始行 (含 payload 原 TEXT, caller JSON.parse). transaction 包住保证
+   * 多 dispatcher 实例并发不会重复取走 (与 claimPendingDispatches 一致).
+   */
+  claimPendingWsMessages(limit: number): any[] {
+    return this.db.transaction(() => {
+      const rows = this.db.prepare(`
+        SELECT id, client_id, channel, payload, retry_count
+        FROM ws_message_queue
+        WHERE status='pending'
+        ORDER BY created_at ASC, id ASC
+        LIMIT ?
+      `).all(limit) as any[];
+      if (rows.length === 0) return [];
+      const ids = rows.map((r: any) => r.id);
+      const placeholders = ids.map(() => '?').join(',');
+      this.db.prepare(`UPDATE ws_message_queue SET status='dispatching' WHERE id IN (${placeholders})`).run(...ids);
+      return rows;
+    })();
+  }
+
+  /** 标记送达 + 写 delivered_at + 清 last_error (P3c.3 send 成功立即调; P3c.4 改 ack 触发). */
+  markWsMessageDelivered(id: number): void {
+    this.db.prepare(`
+      UPDATE ws_message_queue
+      SET status='delivered', delivered_at=datetime('now'), last_error=NULL
+      WHERE id=?
+    `).run(id);
+  }
+
+  /** 递增 retry_count 并复位 status='pending' 让下轮 tick 重取. 写入 last_error. */
+  incrementWsMessageRetry(id: number, err: string): void {
+    this.db.prepare(`
+      UPDATE ws_message_queue
+      SET status='pending', retry_count=retry_count+1, last_error=?
+      WHERE id=?
+    `).run(err, id);
+  }
+
+  /** 终态 failed (不再 claim). 写入 last_error. dispatcher 判 retry_count >= max 时调. */
+  markWsMessageFailed(id: number, err: string): void {
+    this.db.prepare(`UPDATE ws_message_queue SET status='failed', last_error=? WHERE id=?`).run(err, id);
+  }
+
+  /** server 启动期复位 'dispatching' → 'pending' (上次崩溃前未完成的批). */
+  rollbackInProgressWsMessages(): void {
+    this.db.prepare(`UPDATE ws_message_queue SET status='pending' WHERE status='dispatching'`).run();
+  }
+
   getPendingSuggestionsBySource(batchId?: string, sourceModule?: string): any[] {
     const clauses: string[] = ["status = 'pending'"];
     const params: any[] = [];
