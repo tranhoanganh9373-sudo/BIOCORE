@@ -17,6 +17,7 @@
 import http from 'http';
 import { timingSafeEqual } from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
+import { encode as msgpackEncode } from '@msgpack/msgpack';
 import type Database from 'better-sqlite3';
 
 import { hashApiKey } from './middlewares/auth';
@@ -152,6 +153,50 @@ export function buildSubsetPvPayload(
 const WS_SUBSCRIPTION_ENABLED =
   (process.env.WS_SUBSCRIPTION_ENABLED ?? 'true').toLowerCase() !== 'false';
 
+// ============================================================
+// SP-PLC-3 Phase 3a Commit 1 (P3a.1) — WS msgpack 二进制协议
+// ============================================================
+// 协议协商: client connect 时附 `?wire=msgpack` query → server 解析存
+// (ws as any).wireMode; 老 client 不传 query → wireMode='json' (Phase 2
+// 行为完全一致). 非法值 (e.g. wire=xml) → 默认 'json' (不抛, 不 close).
+//
+// Hot-rollback: WS_WIRE_MODE_FORCED=json 全 client 强制 JSON, 无视 query.
+// 用于线上 msgpack 解码出 bug 时立即回退, 不需 client 端 deploy.
+// ============================================================
+export type WireMode = 'msgpack' | 'json';
+
+const WS_WIRE_MODE_FORCED = (process.env.WS_WIRE_MODE_FORCED ?? '').toLowerCase();
+
+/**
+ * 从 connection 时 req.url 解析 wireMode. 老 client / 无 query / 非法值 / env
+ * 强制 → 'json'. 仅 query 严格 = 'msgpack' 且未被 env force 时 → 'msgpack'.
+ */
+export function resolveWireMode(reqUrl: string | undefined, host: string | undefined): WireMode {
+  if (WS_WIRE_MODE_FORCED === 'json') return 'json';
+  try {
+    const url = new URL(reqUrl ?? '', `ws://${host ?? 'localhost'}`);
+    const wire = url.searchParams.get('wire');
+    return wire === 'msgpack' ? 'msgpack' : 'json';
+  } catch {
+    return 'json';
+  }
+}
+
+/**
+ * 给定 envelope (broadcast 全推或 subset), 按 client.wireMode 选择 serializer.
+ * msgpack → Uint8Array (ws.send → binary frame opcode=2);
+ * json    → string      (ws.send → text frame opcode=1).
+ *
+ * 调用方: broadcast fan-out 内. 为避免重复 encode (同 envelope 推 N 个 client),
+ * 建议 caller 用 cache 包装 (见 ws-server.ts broadcast() 内 getJSON/getMsgpack).
+ */
+export function serializeForClient(
+  wireMode: WireMode,
+  envelope: any,
+): string | Uint8Array {
+  return wireMode === 'msgpack' ? msgpackEncode(envelope) : JSON.stringify(envelope);
+}
+
 // SP-FX-47 F-06 (HIGH): timing-safe API Key hash 比较，防止 timing attack。
 // hashApiKey 输出固定 64-char hex (SHA-256)；防御性处理长度不等情况。
 export function safeCompareApiKeyHash(computed: string, stored: string): boolean {
@@ -212,7 +257,14 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
       reactor_id: reactorId ?? null,
       payload,
     };
-    const fullMsg = JSON.stringify(envelope);
+
+    // SP-PLC-3 P3a.1: per-tick serializer cache. 同 envelope 推 N 个 client
+    // 时一次 encode 一次 stringify (lazy), 避免每 client 重复. mixed clients
+    // (msgpack + json) 各只算一次. 老 JSON 路径行为不变, 只是延迟到 first read.
+    let cachedJSON: string | null = null;
+    let cachedMsgpack: Uint8Array | null = null;
+    const getJSON = (): string => (cachedJSON ??= JSON.stringify(envelope));
+    const getMsgpack = (): Uint8Array => (cachedMsgpack ??= msgpackEncode(envelope));
 
     // SP-PLC-3 P2.3: 仅 pv_realtime 走 per-client 订阅过滤. 其它 channel
     // (alarm/step_progress/heartbeat/scada:* 等) 全推 — 与 Phase 1 行为
@@ -232,13 +284,17 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
     wss.clients.forEach((client) => {
       if (client.readyState !== WebSocket.OPEN) return;
 
-      let payloadToSend: string = fullMsg;
+      // SP-PLC-3 P3a.1: 每 client 一套 wireMode 选择 serializer. 默认 'json'
+      // 兼容 connection-handler 未设置的旧路径 (e.g. AUTH_ENABLED=false 早返).
+      const wireMode: WireMode = (client as any).wireMode === 'msgpack' ? 'msgpack' : 'json';
+
+      let payloadToSend: string | Uint8Array;
       if (useFilter) {
         const state = subStates.get(client);
         const resolved = resolveReactorTags(state, reactorId as string);
         if (resolved === null) {
           // 老 client — 全推 (Phase 1 兼容)
-          payloadToSend = fullMsg;
+          payloadToSend = wireMode === 'msgpack' ? getMsgpack() : getJSON();
         } else if (resolved === undefined) {
           // 已订阅但不含此 reactor → skip
           // SP-PLC-3 P2.5: 累计 no-subscription skip 度量 (try/catch 隔离).
@@ -249,9 +305,10 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
           }
           return;
         } else if (resolved === '*') {
-          payloadToSend = fullMsg;
+          payloadToSend = wireMode === 'msgpack' ? getMsgpack() : getJSON();
         } else {
-          // Set<string> — 仅推订阅 tag 子集
+          // Set<string> — 仅推订阅 tag 子集. subset envelope 不命中 cache
+          // (每 client subset 不同), 直接 serialize 一次给该 client.
           const subsetPayload = buildSubsetPvPayload(payload, resolved);
           if (!subsetPayload) {
             // 无任何订阅字段命中 → skip
@@ -263,8 +320,10 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
             }
             return;
           }
-          payloadToSend = JSON.stringify({ ...envelope, payload: subsetPayload });
+          payloadToSend = serializeForClient(wireMode, { ...envelope, payload: subsetPayload });
         }
+      } else {
+        payloadToSend = wireMode === 'msgpack' ? getMsgpack() : getJSON();
       }
 
       try {
@@ -323,7 +382,13 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
     }
 
     (ws as any).user = user;
-    console.log(`[${new Date().toISOString()}] [INFO] [WS] 客户端连接 user=${user.user_id} from=${remoteIp} (总数: ${wss.clients.size})`);
+
+    // SP-PLC-3 P3a.1: 解析 wireMode 存到 ws 实例 (`?wire=msgpack` query
+    // → 'msgpack', 否则 'json'). broadcast 内 fan-out 读此字段选 serializer.
+    // WS_WIRE_MODE_FORCED=json 强制全 client JSON (hot-rollback).
+    (ws as any).wireMode = resolveWireMode(req.url, req.headers.host);
+
+    console.log(`[${new Date().toISOString()}] [INFO] [WS] 客户端连接 user=${user.user_id} wire=${(ws as any).wireMode} from=${remoteIp} (总数: ${wss.clients.size})`);
 
     // SP-PLC-3 P2.3: 处理客户端 subscribe / unsubscribe message. 不合法消息
     // (parse 失败 / type 不识别) 静默忽略 — 不抛, 不 close, 兼容老 client (它们

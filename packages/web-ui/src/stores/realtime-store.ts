@@ -4,6 +4,7 @@
 // ============================================================
 
 import { create } from 'zustand';
+import { decode as msgpackDecode } from '@msgpack/msgpack';
 import type {
   ProcessValues,
   StateUpdatePayload,
@@ -15,6 +16,13 @@ import type {
 } from '@/types';
 import type { TagQuality } from '@/hooks/useTag';
 import { RingBuffer } from './ring-buffer';
+
+// SP-PLC-3 Phase 3a Commit 1 (P3a.1): 与 server 协商二进制协议. true → connect
+// 时 URL 加 `?wire=msgpack` → server fan-out 用 msgpack.encode → onmessage
+// 收 Blob/ArrayBuffer → msgpack.decode. false → 走原 JSON text frame (回滚).
+// 老 server (Phase 2) 不识 wire query 永远发 JSON string, client 仍按 string
+// 分支 JSON.parse — 升级顺序 (client 先于 server) 也不破.
+const USE_MSGPACK_WIRE = true;
 
 // SP-PLC-3 Patch B (2026-05-26): trendBuffer 改 RingBuffer 消除 5×3600 数组
 // spread + slice (audit Finding 1, 估 14 MB/s alloc @ 10 reactor × 5 Hz).
@@ -223,8 +231,20 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
     // 鉴权: 从 localStorage 读 JWT token, 拼接到 URL query string
     // 后端会在 connection handler 中验证, 失败 close(1008)
     const token = typeof window !== 'undefined' ? localStorage.getItem('biocore_token') : null;
-    const url = token ? `${baseUrl}?token=${encodeURIComponent(token)}` : baseUrl;
+    // SP-PLC-3 P3a.1: 协商 msgpack 二进制协议. 与 token 同位置 query string,
+    // 与现 ?token=...&api_key=... 路径一致 (open Q (i) 推荐 A). 老 server
+    // 不识此 query 永远发 JSON, client onmessage 兼容 string 分支.
+    const params: string[] = [];
+    if (token) params.push(`token=${encodeURIComponent(token)}`);
+    if (USE_MSGPACK_WIRE) params.push('wire=msgpack');
+    const url = params.length > 0 ? `${baseUrl}?${params.join('&')}` : baseUrl;
     ws = new WebSocket(url);
+    // SP-PLC-3 P3a.1: 指示浏览器把 binary frame 当 ArrayBuffer 直接交付,
+    // 省一次 Blob → arrayBuffer() async 转换 (默认 'blob'). Node ws 库
+    // 测试环境无此属性, try 包住以兼容.
+    if (USE_MSGPACK_WIRE) {
+      try { ws.binaryType = 'arraybuffer'; } catch { /* test env or unsupported */ }
+    }
 
     ws.onopen = () => {
       set({ wsConnected: true });
@@ -233,10 +253,26 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     };
 
-    ws.onmessage = (event) => {
+    // SP-PLC-3 P3a.1: 双协议 onmessage. server fan-out 按 client wireMode
+    // 发 string (JSON) 或 binary (msgpack); 我们按 event.data 类型分支:
+    //   - ArrayBuffer (binaryType='arraybuffer'): msgpack.decode
+    //   - Blob (binaryType 默认 'blob' 或 fallback): async arrayBuffer() + decode
+    //   - string: JSON.parse (老 server 或 wireMode=json 路径)
+    // 用 async 包整体 — Blob 分支需 await; JSON 分支微小 async 开销可忽略.
+    ws.onmessage = async (event: MessageEvent) => {
       let msg: WSMessage;
       try {
-        msg = JSON.parse(event.data);
+        if (event.data instanceof ArrayBuffer) {
+          msg = msgpackDecode(new Uint8Array(event.data)) as WSMessage;
+        } else if (typeof Blob !== 'undefined' && event.data instanceof Blob) {
+          const buf = await event.data.arrayBuffer();
+          msg = msgpackDecode(new Uint8Array(buf)) as WSMessage;
+        } else if (typeof event.data === 'string') {
+          msg = JSON.parse(event.data) as WSMessage;
+        } else {
+          console.warn('[WS] unknown message type:', typeof event.data);
+          return;
+        }
       } catch (e) {
         console.error('[WS] Failed to parse message:', e);
         return;

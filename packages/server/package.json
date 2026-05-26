@@ -19,6 +19,7 @@
     "@biocore/runtime-guard": "workspace:*",
     "@biocore/soft-sensor": "workspace:*",
     "@influxdata/influxdb-client": "^1.33.0",
+    "@msgpack/msgpack": "^3.0.0",
     "@types/bcrypt": "^6.0.0",
     "@types/papaparse": "^5.5.2",
     "bcrypt": "^6.0.0",

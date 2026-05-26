@@ -16,6 +16,7 @@
     "@dnd-kit/sortable": "^8.0.0",
     "@dnd-kit/utilities": "^3.2.0",
     "@hookform/resolvers": "^3.3.0",
+    "@msgpack/msgpack": "^3.0.0",
     "@svgdotjs/svg.js": "^3.2.4",
     "@tanstack/react-table": "^8.10.0",
     "@types/dompurify": "^3.2.0",
