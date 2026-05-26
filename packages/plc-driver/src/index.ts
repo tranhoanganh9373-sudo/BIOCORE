@@ -710,6 +710,118 @@ export class PollingScheduler extends EventEmitter {
   isRunning(): boolean { return this.running; }
 }
 
+// ─── SP-PLC-3 P3b.1: PollingScheduler worker_threads scaffold ──
+// 把 polling 循环挪到 worker thread, 避免 PLC I/O 阻塞 main event loop.
+// P3b.1 = scaffold + IPC 协议验证 (worker 内 mock snapshot, 不连真 snap7).
+// P3b.2 = worker 内接真 PLCConnectionManager + snap7.
+//
+// 调用方 (P3b.2 在 server/src/index.ts startup 内):
+//   const handle = startSchedulerInWorker({ reactorId, plcConfig, variables, pollRates });
+//   handle.on('snapshot', ({ snap }) => broadcast(snap));
+//   handle.on('error', (err) => log.error(err));
+//   handle.addVariable(newVar);     // 动态加
+//   handle.removeVariable(id);      // 动态删
+//   await handle.stop();            // 平稳 stop (worker 内 timer clear)
+//   await handle.terminate();       // 强杀 worker (5s 超时后用)
+
+import { Worker } from 'worker_threads';
+import * as path from 'path';
+
+/** P3b.1: worker 收发的消息类型 (与 polling-scheduler-worker.ts 同步). */
+export interface WorkerSnapshotMsg {
+  type: 'snapshot';
+  reactorId: string;
+  snap: ProcessSnapshot;
+}
+export type WorkerStateName = 'running' | 'stopped' | 'connecting' | 'failed';
+
+/** P3b.1: startSchedulerInWorker 返回的 handle (EventEmitter + 控制方法). */
+export interface WorkerHandle extends EventEmitter {
+  /** 加入新变量, 下次 tick 生效. */
+  addVariable(v: PLCVariableMapping): void;
+  /** 按 id 删变量, 下次 tick 生效. */
+  removeVariable(id: string): void;
+  /** 平稳停 worker 内 timer (worker 不退出, 等 terminate). */
+  stop(): Promise<void>;
+  /** 强杀 worker, 返 exit code. */
+  terminate(): Promise<number>;
+}
+
+/** P3b.1: startSchedulerInWorker 初始化配置. */
+export interface StartSchedulerInWorkerConfig {
+  reactorId: string;
+  plcConfig: PLCConnectionConfig;
+  variables: PLCVariableMapping[];
+  /** 需 spawn timer 的 rate 集合 (毫秒). e.g. [500, 1000, 5000]. */
+  pollRates: number[];
+  /**
+   * P3b.1 测试 hook: 覆盖默认 worker 文件路径.
+   * 默认从 __dirname 解析到编译后的 dist/worker/polling-scheduler-worker.js,
+   * 测试时可注入 mock 路径.
+   */
+  workerPath?: string;
+}
+
+/**
+ * SP-PLC-3 P3b.1: 在 worker_threads 内启动 PollingScheduler.
+ *
+ * 返回 EventEmitter handle, 4 个事件:
+ *   - 'snapshot': WorkerSnapshotMsg { reactorId, snap }
+ *   - 'state':    WorkerStateName ('running' | 'stopped' | 'connecting' | 'failed')
+ *   - 'error':    Error (worker 内 throw / IPC error message)
+ *   - 'exit':     number (worker 退出 code, 0 = 正常)
+ *
+ * P3b.1 注意: worker 内是 mock 路径, 不真连 snap7. P3b.2 才接.
+ */
+export function startSchedulerInWorker(config: StartSchedulerInWorkerConfig): WorkerHandle {
+  // 默认路径: 编译后 dist/worker/polling-scheduler-worker.js
+  // __dirname @ runtime = .../packages/plc-driver/dist
+  // (NodeNext + 无 "type":"module" → CJS 编译, __dirname 可用)
+  const workerPath = config.workerPath
+    ?? path.join(__dirname, 'worker', 'polling-scheduler-worker.js');
+
+  const worker = new Worker(workerPath);
+  const handle = new EventEmitter() as WorkerHandle;
+
+  worker.on('message', (msg: { type: string; [k: string]: unknown }) => {
+    if (msg.type === 'snapshot') {
+      handle.emit('snapshot', msg as unknown as WorkerSnapshotMsg);
+    } else if (msg.type === 'state') {
+      handle.emit('state', (msg as unknown as { state: WorkerStateName }).state);
+    } else if (msg.type === 'error') {
+      handle.emit('error', new Error(String(msg.message ?? 'worker error')));
+    }
+  });
+  worker.on('error', (err) => handle.emit('error', err));
+  worker.on('exit', (code) => handle.emit('exit', code));
+
+  // 初始化消息 (不传 workerPath, 它是 main-thread-only)
+  worker.postMessage({
+    type: 'init',
+    reactorId: config.reactorId,
+    plcConfig: config.plcConfig,
+    variables: config.variables,
+    pollRates: config.pollRates,
+  });
+
+  handle.addVariable = (v: PLCVariableMapping): void => {
+    worker.postMessage({ type: 'addVariable', variable: v });
+  };
+  handle.removeVariable = (id: string): void => {
+    worker.postMessage({ type: 'removeVariable', id });
+  };
+  handle.stop = async (): Promise<void> => {
+    // 发 stop 消息, worker clearInterval + postBack 'state:stopped'
+    // worker 不自退出, 等 terminate() 强杀 (P3b 决策 Q5: 5s 超时)
+    worker.postMessage({ type: 'stop' });
+  };
+  handle.terminate = async (): Promise<number> => {
+    return await worker.terminate();
+  };
+
+  return handle;
+}
+
 // ─── VFD 变频器 Modbus RTU 客户端 ──────────────────────────
 
 export class VFDModbusClient {
