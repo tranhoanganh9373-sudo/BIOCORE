@@ -7,6 +7,7 @@
 import type { Router } from 'express';
 import type { SQLiteService } from '@biocore/data-service';
 import { computeFieldStats, type FieldStats } from './stats-utils';
+import { fetchBatchTimeSeries } from './batch-intelligence-routes';
 
 // 开发模式: InfluxDB 未部署时使用模拟统计
 const MOCK_INFLUX = process.env.MOCK_PLC === 'true' || !process.env.INFLUX_URL;
@@ -30,10 +31,12 @@ interface BatchCompareResult {
  * 注册批次对比路由
  * @param router Express Router (apiRouter)
  * @param sqlite SQLiteService 实例
+ * @param influxQueryApi InfluxDB QueryApi 实例 (生产模式下用于拉取时序; 未配置时单字段 stats 退化为 null, 不抛错)
  */
 export function registerBatchCompareRoutes(
   router: Router,
   sqlite: SQLiteService,
+  influxQueryApi: any,
 ): void {
 
   // GET /batches/compare?batch_ids=A,B,C&fields=temperature,pH
@@ -87,10 +90,19 @@ export function registerBatchCompareRoutes(
             stats[field] = computeFieldStats(mockValues);
           }
         } else {
-          // 真实 InfluxDB 查询 (需要 influx-client 配置)
-          // TODO: 实机部署时对接 InfluxDB query API
+          // 真实 InfluxDB 查询: 复用 batch-intelligence-routes 的 fetchBatchTimeSeries
+          // 异常守卫: queryApi 缺失或单 field 查询失败仅该 field 退化为 null, 不污染其它 field 也不让 500 冒上来
           for (const field of fields) {
-            stats[field] = null;
+            try {
+              const rawData = await fetchBatchTimeSeries(influxQueryApi, batchId, field);
+              const values = rawData.map(r => r.value);
+              stats[field] = computeFieldStats(values);
+            } catch (fieldErr) {
+              console.warn(
+                `[batch-compare] InfluxDB 查询失败 batch=${batchId} field=${field}: ${(fieldErr as Error).message}`,
+              );
+              stats[field] = null;
+            }
           }
         }
 

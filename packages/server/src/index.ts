@@ -534,7 +534,7 @@ const { app, apiRouter, authEnabled: AUTH_ENABLED } = createApp({
   apiV0Sunset: API_V0_SUNSET,
 });
 
-registerBatchCompareRoutes(apiRouter, sqlite);
+registerBatchCompareRoutes(apiRouter, sqlite, influxQueryApi);
 registerBatchSamplesRoutes(apiRouter, sqlite);
 registerBatchExportRoutes(apiRouter, sqlite);
 registerCalibrationRoutes(apiRouter, sqlite);

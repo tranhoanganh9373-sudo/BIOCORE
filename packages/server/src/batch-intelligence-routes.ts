@@ -18,7 +18,8 @@ const VALID_FIELDS = new Set([
 ]);
 
 // InfluxDB 查询辅助: 拉取单批次单字段时序数据
-async function fetchBatchTimeSeries(
+// 注: export 供 batch-compare-routes 等其它模块复用 (同一查询语义, 避免重复)
+export async function fetchBatchTimeSeries(
   queryApi: any,
   batchId: string,
   field: string,
