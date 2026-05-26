@@ -105,13 +105,18 @@ export class VariableMappingManager {
         throw new Error(`变量 "${v.tag_name}" 配置错误: eng_min (${v.eng_min}) 必须 < eng_max (${v.eng_max})`);
       }
     }
+    // SP-PLC-3 P2.4 配套修复: 加 deadband_abs/_pct 到 INSERT OR REPLACE 列清单,
+    // 否则 plc-config UI 编辑 (e.g. 改 poll_rate_ms) 触发 upsert 会把 P2.1
+    // migration 040 加的 deadband 两列静默 reset 为默认 0 (清掉操作员配的死区).
     this.db.prepare(`INSERT OR REPLACE INTO plc_variable_mappings
       (id,tag_name,description,plc_address,data_type,direction,scaling_enabled,
-       raw_min,raw_max,eng_min,eng_max,eng_unit,"group",poll_rate_ms,enabled,connection_id)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       raw_min,raw_max,eng_min,eng_max,eng_unit,"group",poll_rate_ms,enabled,connection_id,
+       deadband_abs,deadband_pct)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     `).run(v.id, v.tag_name, v.description, v.plc_address, v.data_type, v.direction,
       v.scaling_enabled ? 1 : 0, v.raw_min, v.raw_max, v.eng_min, v.eng_max,
-      v.eng_unit, v.group, v.poll_rate_ms, v.enabled ? 1 : 0, v.connection_id);
+      v.eng_unit, v.group, v.poll_rate_ms, v.enabled ? 1 : 0, v.connection_id,
+      v.deadband_abs ?? 0, v.deadband_pct ?? 0);
   }
 
   deleteVariable(id: string): void {

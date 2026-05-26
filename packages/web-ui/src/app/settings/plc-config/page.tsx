@@ -764,7 +764,25 @@ export default function PLCConfigPage() {
                           {v.group}
                         </Badge>
                       </TableCell>
-                      <TableCell className="text-sm">{v.poll_rate_ms}ms</TableCell>
+                      <TableCell className="text-sm">
+                        {/* SP-PLC-3 P2.4: inline 编辑 poll_rate_ms (Q(vi) 3 档),
+                            服务端 PUT 后调 PollingScheduler.restart() 热生效 */}
+                        <Select
+                          value={String(v.poll_rate_ms)}
+                          onValueChange={async (val) => {
+                            await saveVariable({ ...v, poll_rate_ms: Number(val) });
+                          }}
+                        >
+                          <SelectTrigger className="w-[110px] h-7 text-sm">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="100">100ms (快)</SelectItem>
+                            <SelectItem value="1000">1000ms (标)</SelectItem>
+                            <SelectItem value="10000">10000ms (慢)</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </TableCell>
                       <TableCell>
                         <div className="flex gap-1">
                           <Button size="icon" variant="ghost" className="h-7 w-7"

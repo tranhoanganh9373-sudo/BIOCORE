@@ -247,6 +247,8 @@ import { registerHealthRoutes } from './health-routes';
 import { registerAnalyticsRoutes } from './analytics-routes';
 // SP-PLC-2: 受控 PLC 写入 + audit
 import { registerPlcWriteRoute } from './plc-write-routes';
+// SP-PLC-3 P2.4: PLC 变量动态配置 + scheduler 热生效
+import { registerPlcConfigRoutes } from './plc-config-routes';
 
 // JWT 认证
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
@@ -941,10 +943,9 @@ apiRouter.post('/plc/variables', requireRole('admin'), (req, res) => {
   res.json(v);
 });
 
-apiRouter.put('/plc/variables/:id', requireRole('admin'), (req, res) => {
-  varManager.upsertVariable({ ...req.body, id: req.params.id });
-  res.json({ success: true });
-});
+// SP-PLC-3 P2.4: PUT /plc/variables/:id 已抽到 plc-config-routes.ts
+// (校验 poll_rate_ms 3 档 + scheduler.restart 热生效 + audit). 旧 inline
+// 1 行 upsert 已被替换, 见 registerPlcConfigRoutes 调用.
 
 apiRouter.delete('/plc/variables/:id', requireRole('admin'), (req, res) => {
   varManager.deleteVariable(req.params.id);
@@ -3324,6 +3325,28 @@ const stopFlusher = startInfluxFlusher({
 
 process.on('SIGTERM', () => { stopBroadcaster(); stopFlusher(); });
 process.on('SIGINT', () => { stopBroadcaster(); stopFlusher(); });
+
+// ─── SP-PLC-3 P2.4: PLC 变量动态配置 + scheduler 热生效 ───────────
+// 必须在 pollingSchedulers Map 声明后 register (Map 引用传给闭包,
+// 启动期填充, 请求时按 reactor_id get scheduler 实例).
+registerPlcConfigRoutes(apiRouter, {
+  getVariableById: (id) => varManager.getVariables().find((v) => v.id === id),
+  upsertVariable: (v) => varManager.upsertVariable(v),
+  pollingSchedulers,
+  getReactorIdsByPlcId: (plcId) => {
+    const binding = sqlite.getPlcReactorBinding(plcId);
+    return binding ? [binding.reactor_id] : [];
+  },
+  writeAuditLog: (entry) => sqlite.writeAuditLog({
+    user_id: entry.user_id,
+    action: entry.action,
+    target_type: entry.target_type,
+    target_id: entry.target_id,
+    old_value: entry.old_value,
+    new_value: entry.new_value,
+    ip_address: entry.ip_address,
+  }),
+});
 
 // route-handler-split (post v1.12.0): single buildReactorConfig factory
 // shared by /reactors POST, /reactors/:id/download-recipe, and the
