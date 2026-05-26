@@ -92,6 +92,12 @@ export interface ReactorWiringDeps {
   // SP-PLC-3 P2 (Q5): pollingSchedulers 可选; MOCK_PLC 或某 reactor 无 PLC
   // 绑定时不创建 scheduler, reactor-wiring 走 buildMockSnapshot 写 cache.
   pollingSchedulers?: Map<string, PollingScheduler>;
+  /**
+   * SP-PLC-3 P2.5: 可选回调, 每次 mock 路径 tagCache.write 触发一次, 用于
+   * cache-metrics 的 biocore_tagcache_writes_total Counter inc. 不传 → 该
+   * 路径 writes_total 不累计 (仅真实 PLC 路径计数), 兼容老 wiring.
+   */
+  onCacheWrite?: (reactorId: string) => void;
 }
 
 /**
@@ -128,7 +134,7 @@ export interface ReactorWiringHandles {
 }
 
 export function createReactorWiring(deps: ReactorWiringDeps): ReactorWiringHandles {
-  const { sqlite, influxWriteApi, broadcast, autoCollectDoeResponses, tagCache, pollingSchedulers } = deps;
+  const { sqlite, influxWriteApi, broadcast, autoCollectDoeResponses, tagCache, pollingSchedulers, onCacheWrite } = deps;
 
   // 启动单个反应器的时序采集 (60秒一次写入 InfluxDB)
   function startReactorCollector(reactorId: string): void {
@@ -164,6 +170,8 @@ export function createReactorWiring(deps: ReactorWiringDeps): ReactorWiringHandl
         //     写入 cache, 本 tick 直接从 cache 读最新值 (cache 暖机期
         //     1×poll_rate_ms 内可能为空, 落 0 兜底跟旧行为一致, plan §2b).
         if (MOCK_PLC || !pollingSchedulers?.get(reactorId)) {
+          // SP-PLC-3 P2.5: 显式 inc writes_total (回调注入, 不传 → noop, 兼容老 wiring).
+          if (onCacheWrite) onCacheWrite(reactorId);
           tagCache.write(reactorId, buildMockSnapshot(TAGS, reactorId));
         }
 

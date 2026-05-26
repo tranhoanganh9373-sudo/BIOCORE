@@ -697,12 +697,19 @@ const mqttPublisher = createMqttPublisher({
   enabled: process.env.MQTT_ENABLED !== 'false',
 });
 
+// SP-PLC-3 P2.5: ws-server skip 事件回调 (no-subscription). cache-metrics 在
+// 本 module 后段才 register (依赖 tagCache, 须先于 reactorManager wiring), 此处
+// 用 mutable ref 延迟绑定. cache-metrics register 后赋值 → 后续 skip 才会累计.
+let onWsSkip: ((reason: 'no-subscription') => void) | null = null;
+
 const { wss, broadcast } = createWsServer({
   server,
   sqlite,
   verifyJWT,
   authEnabled: AUTH_ENABLED,
   mqttPublisher,
+  // 延迟到 cache-metrics 注册后真正生效; ref 仍为 null 时为 noop.
+  onSkip: (reason) => { onWsSkip?.(reason); },
 });
 
 // M3 (Level 3): MQTT subscriber — 外部 HMI 写意图 → 建议缓冲区
@@ -3267,6 +3274,19 @@ import type { PollingScheduler } from '@biocore/plc-driver';
 const tagCache = new TagCache();
 const pollingSchedulers = new Map<string, PollingScheduler>();
 
+// SP-PLC-3 P2.5: cache 监控指标. 必须在 createReactorWiring 之前注册, 因为
+// wiring 的 mock 路径 (reactor-wiring.ts:167) 调 onCacheWrite 回调累计
+// biocore_tagcache_writes_total. cache-metrics 仅依赖 tagCache + reactorManager
+// + metricsRegistry, 都已在 module 顶端 available.
+import { registerCacheMetrics } from './engine/cache-metrics';
+const cacheMetrics = registerCacheMetrics({
+  registry: metricsRegistry,
+  tagCache,
+  reactorIds: () => reactorManager.listReactors().map((r) => r.id),
+});
+// 绑定上文 createWsServer 的 onSkip mutable ref (no-subscription 路径).
+onWsSkip = (reason) => cacheMetrics.skippedTotal.inc({ reason });
+
 const {
   startReactorCollector,
   stopReactorCollector,
@@ -3278,6 +3298,8 @@ const {
   autoCollectDoeResponses,
   tagCache,
   pollingSchedulers,
+  // SP-PLC-3 P2.5: mock 路径 write_total 累计.
+  onCacheWrite: () => cacheMetrics.writesTotal.inc(),
 });
 
 // ─── SP-PLC-3 P3: broadcaster + flusher (plan §1 Commit 3) ─────────
@@ -3292,6 +3314,8 @@ const {
 // "高频读 + 高频 cache + 1Hz Influx + 5Hz dirty WS".
 import { startRealtimeBroadcaster } from './engine/realtime-broadcaster';
 import { startInfluxFlusher } from './engine/influx-flusher';
+// SP-PLC-3 P2.5: InfluxDB 分级采样 (cache-metrics 已在 createReactorWiring 前注册).
+import { startDownsampleFlusher } from './engine/downsample-flusher';
 
 const stopBroadcaster = startRealtimeBroadcaster({
   tagCache,
@@ -3306,6 +3330,8 @@ const stopBroadcaster = startRealtimeBroadcaster({
       ? ctrl.currentBatchId
       : null;
   },
+  // SP-PLC-3 P2.5: back-pressure skip 累计到 cache-metrics.
+  onSkip: (reason) => cacheMetrics.skippedTotal.inc({ reason }),
 });
 
 const stopFlusher = startInfluxFlusher({
@@ -3323,8 +3349,39 @@ const stopFlusher = startInfluxFlusher({
   },
 });
 
-process.on('SIGTERM', () => { stopBroadcaster(); stopFlusher(); });
-process.on('SIGINT', () => { stopBroadcaster(); stopFlusher(); });
+// SP-PLC-3 P2.5: InfluxDB 分级采样 — 写独立 downsampled bucket (10s 1 Point/field/reactor 均值).
+// 启动条件: INFLUX_DOWNSAMPLED_BUCKET 非空 + influxClient 已连 (有 token). 任一不满足 → 不启动.
+const INFLUX_DOWNSAMPLED_BUCKET = process.env.INFLUX_DOWNSAMPLED_BUCKET || '';
+let stopDownsampleFlusher: (() => void) | null = null;
+if (INFLUX_DOWNSAMPLED_BUCKET && influxClient) {
+  // 与主 bucket 同样做白名单校验, 防 Flux 注入面 (跟 line 297-302 同语义).
+  if (!/^[a-zA-Z0-9_-]+$/.test(INFLUX_DOWNSAMPLED_BUCKET)) {
+    throw new Error(`INFLUX_DOWNSAMPLED_BUCKET 含非法字符: ${INFLUX_DOWNSAMPLED_BUCKET}`);
+  }
+  const influxDownsampleApi = influxClient.getWriteApi(INFLUX_ORG, INFLUX_DOWNSAMPLED_BUCKET, 's');
+  stopDownsampleFlusher = startDownsampleFlusher({
+    tagCache,
+    influxDownsampleApi,
+    reactorIds: () => reactorManager.listReactors().map((r) => r.id),
+    getBatchId: (reactorId) => {
+      const ctrl = reactorManager.getReactor(reactorId);
+      if (!ctrl) return 'idle';
+      return ctrl.currentState === 'running' && ctrl.currentBatchId
+        ? ctrl.currentBatchId
+        : 'idle';
+    },
+  });
+  console.log(
+    `[${new Date().toISOString()}] [INFO] [downsample-flusher] 已启动 bucket=${INFLUX_DOWNSAMPLED_BUCKET} flushMs=${process.env.DOWNSAMPLE_FLUSH_MS || '10000'}`,
+  );
+} else {
+  console.log(
+    `[${new Date().toISOString()}] [INFO] [downsample-flusher] 未启动 (INFLUX_DOWNSAMPLED_BUCKET=${INFLUX_DOWNSAMPLED_BUCKET || '<empty>'}, influxClient=${influxClient ? 'ok' : 'null'})`,
+  );
+}
+
+process.on('SIGTERM', () => { stopBroadcaster(); stopFlusher(); cacheMetrics.stop(); stopDownsampleFlusher?.(); });
+process.on('SIGINT', () => { stopBroadcaster(); stopFlusher(); cacheMetrics.stop(); stopDownsampleFlusher?.(); });
 
 // ─── SP-PLC-3 P2.4: PLC 变量动态配置 + scheduler 热生效 ───────────
 // 必须在 pollingSchedulers Map 声明后 register (Map 引用传给闭包,
@@ -3702,7 +3759,11 @@ async function start(): Promise<void> {
           // SP-PLC-3 P2.2: 把 deadbandResolver 注入 write opts, 让 P2.1 ship 的
           // per-tag deadband 真正作用于 cache → broadcaster (dirty-only) +
           // flusher (lastChanged-only) 双路径.
-          scheduler.on('snapshot', (snap: any) => tagCache.write(reactor.id, snap, { deadbandResolver }));
+          scheduler.on('snapshot', (snap: any) => {
+            // SP-PLC-3 P2.5: 显式 inc writesTotal (含 deadband 抑制的 write — 与 metric 命名一致).
+            cacheMetrics.writesTotal.inc();
+            tagCache.write(reactor.id, snap, { deadbandResolver });
+          });
           scheduler.on('error', (err: any) => {
             console.error(`[${new Date().toISOString()}] [ERROR] [scheduler:${reactor.id}]`, err);
             tagCache.markStale(reactor.id);

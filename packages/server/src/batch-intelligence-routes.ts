@@ -8,7 +8,8 @@
 import type { Router } from 'express';
 import type { SQLiteService } from '@biocore/data-service';
 import { dtwDistanceV2 as dtwDistance, rankBySimilarity, buildEnvelope, checkEnvelope } from '@biocore/ai-analytics';
-import { lttb } from './lttb';
+// SP-PLC-3 P2.5: downsampleValues 抽到 lib/downsample.ts 共享 (与 downsample-flusher 共用)
+import { downsampleValues } from './lib/downsample';
 
 const INFLUX_BUCKET = process.env.INFLUX_BUCKET || 'fermentation';
 const MOCK_INFLUX = process.env.MOCK_PLC === 'true' || !process.env.INFLUX_URL;
@@ -50,12 +51,8 @@ export async function fetchBatchTimeSeries(
   return rows;
 }
 
-// LTTB 降采样到 targetPoints 个值
-function downsampleValues(data: { time: number; value: number }[], targetPoints = 200): number[] {
-  if (data.length <= targetPoints) return data.map(d => d.value);
-  const sampled = lttb(data, targetPoints, d => d.time, d => d.value);
-  return sampled.map(d => d.value);
-}
+// SP-PLC-3 P2.5: 原 inline downsampleValues 已抽到 lib/downsample.ts 共享给
+// downsample-flusher; 此处 import 见文件顶部.
 
 // 生成模拟时序数据 (开发模式)
 function mockTimeSeries(batchId: string, field: string): number[] {

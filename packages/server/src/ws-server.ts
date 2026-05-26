@@ -180,10 +180,18 @@ export interface CreateWsServerOptions {
   verifyJWT: (token: string) => Record<string, any> | null;
   authEnabled: boolean;
   mqttPublisher?: MqttPublisher;   // 可选: 提供时所有 broadcast 自动 mirror 到 MQTT topic
+  /**
+   * SP-PLC-3 P2.5: 可选 skip 事件回调. pv_realtime fan-out 时若某 client
+   * 因 subscription 不匹配而 skip (subs Map 不含 reactor / subset payload
+   * 命中 0 字段), 调一次 onSkip('no-subscription'). 用于 cache-metrics 累计
+   * biocore_broadcaster_skipped_total{reason='no-subscription'} 计数器.
+   * 不传 → 行为不变 (老 wiring 兼容).
+   */
+  onSkip?: (reason: 'no-subscription') => void;
 }
 
 export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
-  const { server, sqlite, verifyJWT, authEnabled, mqttPublisher } = opts;
+  const { server, sqlite, verifyJWT, authEnabled, mqttPublisher, onSkip } = opts;
 
   const wss = new WebSocketServer({ server, path: '/ws' });
 
@@ -233,13 +241,28 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
           payloadToSend = fullMsg;
         } else if (resolved === undefined) {
           // 已订阅但不含此 reactor → skip
+          // SP-PLC-3 P2.5: 累计 no-subscription skip 度量 (try/catch 隔离).
+          if (onSkip) {
+            try { onSkip('no-subscription'); } catch (e) {
+              console.warn(`[WS] onSkip threw: ${(e as Error).message}`);
+            }
+          }
           return;
         } else if (resolved === '*') {
           payloadToSend = fullMsg;
         } else {
           // Set<string> — 仅推订阅 tag 子集
           const subsetPayload = buildSubsetPvPayload(payload, resolved);
-          if (!subsetPayload) return; // 无任何订阅字段命中 → skip
+          if (!subsetPayload) {
+            // 无任何订阅字段命中 → skip
+            // SP-PLC-3 P2.5: 同上, 累计 no-subscription skip 度量.
+            if (onSkip) {
+              try { onSkip('no-subscription'); } catch (e) {
+                console.warn(`[WS] onSkip threw: ${(e as Error).message}`);
+              }
+            }
+            return;
+          }
           payloadToSend = JSON.stringify({ ...envelope, payload: subsetPayload });
         }
       }

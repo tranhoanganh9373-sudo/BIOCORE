@@ -56,6 +56,13 @@ export interface BroadcasterDeps {
   tickMs?: number;
   /** 默认 1MB (1048576), 可被 env WS_MAX_BUFFERED_AMOUNT override. */
   maxBufferedAmount?: number;
+  /**
+   * SP-PLC-3 P2.5: 可选 skip 事件回调. 每次因 back-pressure 整 reactor skip
+   * fan-out 时调一次 (per reactor). 用于 cache-metrics 累计
+   * biocore_broadcaster_skipped_total{reason='back-pressure'} 计数器.
+   * 不传 → 行为不变 (老 wiring 兼容).
+   */
+  onSkip?: (reason: 'back-pressure') => void;
 }
 
 /**
@@ -139,6 +146,13 @@ export function startRealtimeBroadcaster(deps: BroadcasterDeps): () => void {
           console.warn(
             `[${new Date().toISOString()}] [WARN] [broadcaster] back-pressure skip reactor=${reactorId} slowClients=${slowClientCount} threshold=${maxBufferedAmount}`,
           );
+          // SP-PLC-3 P2.5: 通知 cache-metrics 累计 skip 计数 (可选回调, 老 wiring 不传).
+          // try/catch 隔离, callback 抛错不影响其它 reactor 本 tick.
+          if (deps.onSkip) {
+            try { deps.onSkip('back-pressure'); } catch (e) {
+              console.error(`[${new Date().toISOString()}] [ERROR] [broadcaster] onSkip callback threw:`, (e as Error).message);
+            }
+          }
           continue;
         }
 
