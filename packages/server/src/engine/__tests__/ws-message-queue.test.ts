@@ -24,6 +24,7 @@ import {
   enqueueCriticalMessage,
   startWsMessageQueueDispatcher,
   WS_QUEUE_DEFAULTS,
+  __resetPendingAcksForTests,
   type WsMessageQueueDeps,
   type WsQueueSqliteShape,
 } from '../ws-message-queue';
@@ -74,6 +75,8 @@ function startAndCapture(deps: WsMessageQueueDeps) {
 describe('SP-PLC-3 P3c.3 — ws_message_queue dispatcher', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // P3c.4: module-scope pendingAcks 跨 test 污染防护.
+    __resetPendingAcksForTests();
   });
 
   it('T1: enqueueCriticalMessage 写 sqlite + 返 row id', () => {
@@ -95,7 +98,7 @@ describe('SP-PLC-3 P3c.3 — ws_message_queue dispatcher', () => {
     handle.stop();
   });
 
-  it('T3: tickOnce claim 后 ws.send + markDelivered', () => {
+  it('T3: tickOnce claim 后 ws.send 含 msg_id, **不**立即 markDelivered (P3c.4: 等 ack)', () => {
     const sqlite = makeMockSqlite();
     const ws = makeMockWs('client-1', 1);
     (sqlite.claimPendingWsMessages as any).mockReturnValueOnce([
@@ -106,8 +109,9 @@ describe('SP-PLC-3 P3c.3 — ws_message_queue dispatcher', () => {
     handle.tickOnce();
     expect(ws.send).toHaveBeenCalledTimes(1);
     const sent = JSON.parse((ws.send as any).mock.calls[0][0] as string);
-    expect(sent).toEqual({ channel: 'alarm', payload: { a: 1 } });
-    expect(sqlite.markWsMessageDelivered).toHaveBeenCalledWith(10);
+    // P3c.4: envelope 加 msg_id (= row.id), 等 client send back {type:'ack', msg_id} 才 markDelivered.
+    expect(sent).toEqual({ msg_id: 10, channel: 'alarm', payload: { a: 1 } });
+    expect(sqlite.markWsMessageDelivered).not.toHaveBeenCalled();
     expect(sqlite.incrementWsMessageRetry).not.toHaveBeenCalled();
     expect(sqlite.markWsMessageFailed).not.toHaveBeenCalled();
     handle.stop();
@@ -174,7 +178,7 @@ describe('SP-PLC-3 P3c.3 — ws_message_queue dispatcher', () => {
     handle.stop();
   });
 
-  it('T8: batch claim 返多条全 process', () => {
+  it('T8: batch claim 返多条全 send (P3c.4: markDelivered 由 ack 触发, 此处仍 0)', () => {
     const sqlite = makeMockSqlite();
     const ws1 = makeMockWs('c1', 1);
     const ws2 = makeMockWs('c2', 1);
@@ -190,7 +194,8 @@ describe('SP-PLC-3 P3c.3 — ws_message_queue dispatcher', () => {
     expect(ws1.send).toHaveBeenCalledTimes(1);
     expect(ws2.send).toHaveBeenCalledTimes(1);
     expect(ws3.send).toHaveBeenCalledTimes(1);
-    expect(sqlite.markWsMessageDelivered).toHaveBeenCalledTimes(3);
+    // P3c.4: send 后入 pendingAcks 等 ack, 不再立即 markDelivered.
+    expect(sqlite.markWsMessageDelivered).not.toHaveBeenCalled();
     handle.stop();
   });
 

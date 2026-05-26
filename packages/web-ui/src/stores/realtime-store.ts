@@ -203,6 +203,12 @@ let intentionalDisconnect = false;
 // 真正以最新 'connection.id' 为准.
 let clientId: string | null = null;
 const CLIENT_ID_STORAGE_KEY = 'biocore_ws_client_id';
+
+// SP-PLC-3 Phase 3c Commit 4 (P3c.4): critical channel 白名单 — 与 server
+// engine/ws-message-queue.ts CRITICAL_CHANNELS 严格对齐. 收到这些 channel
+// 且 envelope 含 msg_id 时 auto-send back {type:'ack', msg_id}. pv_realtime
+// (5Hz × N client) 不发 ack 避免反向流量爆 (best-effort policy).
+const WS_CRITICAL_CHANNELS = new Set<string>(['alarm', 'state_update', 'recipe_downloaded']);
 if (typeof window !== 'undefined') {
   try {
     clientId = localStorage.getItem(CLIENT_ID_STORAGE_KEY);
@@ -306,6 +312,27 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
           try { localStorage.setItem(CLIENT_ID_STORAGE_KEY, newClientId); } catch { /* noop */ }
         }
         return;
+      }
+
+      // SP-PLC-3 P3c.4: critical channel envelope auto-ack. server 端 (P3c.4)
+      // 在 ws-message-queue dispatchOne 给 critical 消息附 msg_id (= sqlite row.id),
+      // 等 client send back {type:'ack', msg_id} 才 markDelivered. 否则 5s 超时
+      // 触发 incrementRetry, max 3 次后 markFailed. **不要 await / 不要 return**
+      // — ack 反送是侧效, 主路径继续 switch(msg.channel) 走业务 store update.
+      // ws.send 在 connecting/closing 状态会抛, try/catch 静默吞 (下次 reconnect
+      // 自然 retry; 已 enqueue 的消息 server 端超时重投).
+      const msgId = (msg as any).msg_id;
+      if (
+        typeof msgId === 'number' &&
+        WS_CRITICAL_CHANNELS.has(msg.channel) &&
+        ws &&
+        ws.readyState === WebSocket.OPEN
+      ) {
+        try {
+          ws.send(JSON.stringify({ type: 'ack', msg_id: msgId }));
+        } catch (e) {
+          console.warn('[WS] send ack failed:', e);
+        }
       }
 
       // 多反应器隔离 helper: 把 partial 合并到 reactorData[rid]

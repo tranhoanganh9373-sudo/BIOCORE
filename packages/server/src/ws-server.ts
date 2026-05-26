@@ -347,10 +347,20 @@ export interface CreateWsServerOptions {
    * 在 P3c.5 server 启动期: opts.enqueueWsMessage = (e) => sqlite.enqueueWsMessage(e).
    */
   enqueueWsMessage?: (entry: { client_id: string; channel: string; payload: any }) => number;
+  /**
+   * SP-PLC-3 P3c.4: 可选 ack 回调. 注入时 ws message handler 收到 client
+   * {type:'ack', msg_id} 调一次, 返 true=找到 pending entry 并 markDelivered,
+   * false=未知/重复/已超时 → 静默忽略. 不注入 → ack message 静默 drop
+   * (回滚兼容: server 仍可启动, 但 critical 消息永远超时 retry, 最终 failed).
+   *
+   * 实际接通在 P3c.5 server 启动期: opts.markAckReceived = (msgId) =>
+   * markAckReceived(sqlite, msgId) (engine/ws-message-queue 导出).
+   */
+  markAckReceived?: (msgId: number) => boolean;
 }
 
 export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
-  const { server, sqlite, verifyJWT, authEnabled, mqttPublisher, onSkip, enqueueWsMessage } = opts;
+  const { server, sqlite, verifyJWT, authEnabled, mqttPublisher, onSkip, enqueueWsMessage, markAckReceived } = opts;
 
   const wss = new WebSocketServer({ server, path: '/ws' });
 
@@ -561,6 +571,20 @@ export function createWsServer(opts: CreateWsServerOptions): WsServerHandles {
       try {
         msg = JSON.parse(rawData.toString());
       } catch {
+        return;
+      }
+      // SP-PLC-3 P3c.4: client {type:'ack', msg_id} 路径 — critical channel
+      // 消息 delivery 确认. 优先级最高 (在 subscribe 之前判, 因 ack 频率更高),
+      // markAckReceived 未注入时 (hot-rollback / 测试) 静默 drop.
+      // 不冒泡到 handleSubscriptionMessage (msg.type='ack' 走我们这里 return).
+      if (msg && msg.type === 'ack' && typeof msg.msg_id === 'number') {
+        if (markAckReceived) {
+          try {
+            markAckReceived(msg.msg_id);
+          } catch (e) {
+            console.warn(`[WS] markAckReceived threw for msg_id=${msg.msg_id}: ${(e as Error).message}`);
+          }
+        }
         return;
       }
       // P2.3 仅处理订阅协议; 其它 message type (writeTag 等)
