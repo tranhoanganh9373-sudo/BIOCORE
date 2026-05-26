@@ -24,7 +24,9 @@ export interface BiocorePlugin {
   propertySchemas?: WidgetPropertySchema[];
   /**
    * 可选: plugin 自带 i18n 字典.
-   * TODO SP-FX-46: 集成 i18n.addDictionary() 后自动注入全局字典.
+   * ✅ SP-FX-46: 注册时自动调用 i18n.addDictionary() 合并到全局字典.
+   * 推荐 key 前缀 `plugin.<pluginId>.<key>`, 避免误覆盖系统 key.
+   * 冲突时 console.warn 报告, 后注册覆盖先注册.
    */
   dictionaries?: {
     zh?: Record<string, string>;

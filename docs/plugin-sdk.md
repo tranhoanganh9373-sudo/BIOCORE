@@ -1,7 +1,7 @@
 # BIOCore Plugin SDK 开发者指南
 
-**Sprint**: SP-FX-45  
-**版本**: 1.0.0  
+**Sprint**: SP-FX-45 + SP-FX-46 (i18n 集成)  
+**版本**: 1.1.0  
 **路径**: `packages/web-ui/src/scada-engine/plugins/`
 
 ---
@@ -64,12 +64,12 @@ registerPlugin(plugin)
   2. 重复检查: 同 id 已注册则 throw
   3. gaugeRegistry.register(meta) × len(widgets)
   4. WIDGET_SCHEMAS[widgetType] = schema × len(propertySchemas)
-  5. TODO SP-FX-46: i18n.addDictionary(locale, dict)
+  5. ✅ SP-FX-46: addDictionary('zh'|'en', dict, { source: `plugin:${id}` })
   6. plugin.onLoad?.()
   7. pluginStore.set(id, plugin)
 ```
 
-**注意**: `unregisterPlugin` 仅从 pluginStore 移除，widget 仍留在 gaugeRegistry（已知限制，待 SP-FX-46 修复）。
+**注意**: `unregisterPlugin` 仅从 pluginStore 移除，widget/字典仍留在 gaugeRegistry/i18n DICTS（已知限制，待后续 sprint 修复 gaugeRegistry.unregister + addDictionary 配套 removal API）。
 
 ---
 
@@ -152,6 +152,42 @@ import { myPlugin } from './my-plugin';
 registerPlugin(myPlugin);
 ```
 
+### 5.4 i18n 字典 (SP-FX-46)
+
+Plugin 可在 `dictionaries.zh` / `dictionaries.en` 中提供翻译，registerPlugin 时自动调用
+`i18n.addDictionary(locale, dict, { source: 'plugin:<id>' })` 合并到全局字典。已挂载组件
+通过 `useLocale().t(key)` 即可读取。
+
+**Key 前缀约定** (强烈推荐, 但不强制):
+
+```
+plugin.<pluginId>.<key>          ← 推荐, 隔离 plugin 命名空间
+my-gauge.label                   ← 不推荐, 易与系统 key 冲突
+```
+
+例: plugin id `com.example.clock` 的字典 key 建议形如 `plugin.com.example.clock.title`。
+
+**冲突策略**:
+
+| 场景 | 行为 |
+|------|------|
+| 与系统字典 (`dict-zh.json` / `dict-en.json`) 同 key | plugin 覆盖系统, console.warn 报告 |
+| 两 plugin 同 key | 后注册 plugin 覆盖先注册, console.warn 报告 |
+| 同一 plugin 多次 addDictionary 同 key | 后调用覆盖, console.warn 报告 |
+
+**冲突日志格式**:
+
+```
+[i18n.addDictionary] key conflict locale="zh" key="<the key>" source="plugin:<id>" — overriding previous value
+```
+
+**调用时机**: registerPlugin 时一次性注入。由于 `useLocale().t` 被 `useCallback` 缓存 (deps=[locale])，
+已挂载组件的 `t` 引用不变；下一次 locale 切换 / 组件 re-mount / props 触发的 re-render 即可读到新 key。
+建议 plugin 在用户进入相关页面前 (启动阶段) 注册，避免运行时再注册导致部分组件读不到。
+
+**SSR 注意**: 字典内容应在 server + client 共享的入口注册以避免 hydration mismatch。若 plugin 仅
+客户端注册，服务端首屏会 fallback key 自身，客户端 hydrate 时可能触发 React warn。
+
 ---
 
 ## 6. 安全约束
@@ -182,8 +218,13 @@ Plugin 遵守以下安全规则（由 loader 自动检查）：
 
 ## 8. 后续路线 (Future Work)
 
-### SP-FX-46: i18n 集成
-开放 `i18n.addDictionary(locale, dict)` API，允许 plugin 字典自动注入全局 `useLocale` hook。
+### ✅ SP-FX-46: i18n 集成 (已完成)
+`addDictionary(locale, dict, opts?)` API 已开放 (导出位置 `@/i18n/useLocale`)，
+plugin 字典在 `registerPlugin` 时自动注入全局 `useLocale` hook。详见 § 5.4。
+
+### addDictionary removal API
+当前 `unregisterPlugin` 不会从全局字典移除该 plugin 注入的 key。需配套实现
+`removeDictionary(locale, keys, opts?)` 才能完整支持 plugin 热卸载的 i18n 清理。
 
 ### 远程 Plugin / npm 安装
 生产环境需要：

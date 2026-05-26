@@ -2,6 +2,7 @@
 import type { BiocorePlugin } from './types';
 import { gaugeRegistry } from '../gauges/gauge-registry';
 import { WIDGET_SCHEMAS } from '../editor/properties/widget-schemas';
+import { addDictionary } from '../../i18n/useLocale';
 
 /**
  * 禁止 plugin 使用的词汇（防止绕过 PLC 安全约束）.
@@ -36,7 +37,7 @@ const pluginStore = new Map<string, BiocorePlugin>();
  * 2. 重复注册检查
  * 3. 注入 widgets → gaugeRegistry
  * 4. 注入 propertySchemas → WIDGET_SCHEMAS
- * 5. TODO SP-FX-46: 注入 dictionaries → i18n.addDictionary
+ * 5. ✅ SP-FX-46: 注入 dictionaries → i18n.addDictionary
  * 6. 调用 onLoad()
  * 7. 存入 pluginStore
  */
@@ -70,9 +71,14 @@ export function registerPlugin(plugin: BiocorePlugin): void {
     });
   }
 
-  // TODO SP-FX-46: 集成 i18n.addDictionary(locale, dict) when API is available
-  // if (plugin.dictionaries?.zh) i18n.addDictionary('zh', plugin.dictionaries.zh);
-  // if (plugin.dictionaries?.en) i18n.addDictionary('en', plugin.dictionaries.en);
+  // ✅ SP-FX-46: 注入 plugin 字典到全局 i18n
+  const dictSource = `plugin:${plugin.id}`;
+  if (plugin.dictionaries?.zh) {
+    addDictionary('zh', plugin.dictionaries.zh, { source: dictSource });
+  }
+  if (plugin.dictionaries?.en) {
+    addDictionary('en', plugin.dictionaries.en, { source: dictSource });
+  }
 
   // 生命周期回调
   plugin.onLoad?.();

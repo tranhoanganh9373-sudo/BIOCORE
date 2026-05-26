@@ -1,6 +1,15 @@
 // SP-FX-45: Plugin loader 测试 (TDD RED-first)
+// SP-FX-46: 追加 i18n.addDictionary 集成测试
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { renderHook } from '@testing-library/react';
 import type { BiocorePlugin } from '../types';
+
+// next/navigation mock (SP-FX-46 集成测试中 useLocale → LocaleProvider 依赖)
+vi.mock('next/navigation', () => ({
+  useSearchParams: () => ({ get: (_k: string) => null }),
+  useRouter: () => ({ replace: vi.fn() }),
+  usePathname: () => '/',
+}));
 
 // 构造测试用 plugin
 function makePlugin(overrides: Partial<BiocorePlugin> = {}): BiocorePlugin {
@@ -87,5 +96,56 @@ describe('Plugin Loader', () => {
     registerPlugin(plugin);
     unregisterPlugin('com.test.widget');
     expect(onUnload).toHaveBeenCalledOnce();
+  });
+
+  // ── SP-FX-46: dictionaries 集成 ─────────────────────────────────────────
+  it('9. plugin 带 dictionaries.zh 注册后 useLocale.t 能读到', async () => {
+    const { registerPlugin } = await import('../loader');
+    const { useLocale, LocaleProvider } = await import('../../../i18n/useLocale');
+    const plugin = makePlugin({
+      id: 'com.test.dict.zh',
+      dictionaries: { zh: { 'plugin.test.foo': '插件 Foo 中文' } },
+    });
+    registerPlugin(plugin);
+    const { result } = renderHook(() => useLocale(), { wrapper: LocaleProvider });
+    expect(result.current.t('plugin.test.foo')).toBe('插件 Foo 中文');
+  });
+
+  it('10. plugin 带 dictionaries.en 注册并切到 en 后能读到', async () => {
+    localStorage.setItem('biocore.locale', 'en');
+    const { registerPlugin } = await import('../loader');
+    const { useLocale, LocaleProvider } = await import('../../../i18n/useLocale');
+    const plugin = makePlugin({
+      id: 'com.test.dict.en',
+      dictionaries: { en: { 'plugin.test.bar': 'Plugin Bar EN' } },
+    });
+    registerPlugin(plugin);
+    const { result } = renderHook(() => useLocale(), { wrapper: LocaleProvider });
+    expect(result.current.locale).toBe('en');
+    expect(result.current.t('plugin.test.bar')).toBe('Plugin Bar EN');
+  });
+
+  it('11. plugin 无 dictionaries 字段时 registerPlugin 仍正常 (向后兼容)', async () => {
+    const { registerPlugin, listPlugins } = await import('../loader');
+    const plugin = makePlugin({ id: 'com.test.no.dict' });
+    expect(() => registerPlugin(plugin)).not.toThrow();
+    expect(listPlugins().some((p) => p.id === 'com.test.no.dict')).toBe(true);
+  });
+
+  it('12. plugin dictionaries 冲突时 console.warn 含 plugin:<id> source', async () => {
+    const { registerPlugin } = await import('../loader');
+    const { addDictionary } = await import('../../../i18n/useLocale');
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // 先种一个 key
+    addDictionary('zh', { 'plugin.test.conflict': 'pre' }, { source: 'pre' });
+    // plugin 注册同 key
+    registerPlugin(makePlugin({
+      id: 'com.test.conflict',
+      dictionaries: { zh: { 'plugin.test.conflict': 'plugin-value' } },
+    }));
+    expect(warnSpy).toHaveBeenCalled();
+    const msg = warnSpy.mock.calls[warnSpy.mock.calls.length - 1][0] as string;
+    expect(msg).toContain('source="plugin:com.test.conflict"');
+    warnSpy.mockRestore();
   });
 });
