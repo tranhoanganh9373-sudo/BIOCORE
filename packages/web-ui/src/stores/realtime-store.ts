@@ -13,6 +13,7 @@ import type {
   BatchRuntimeState,
   BranchEvaluationEntry,
 } from '@/types';
+import type { TagQuality } from '@/hooks/useTag';
 
 interface HeartbeatStatus {
   pc: number;
@@ -77,6 +78,12 @@ export interface ReactorRuntimeData {
     rpm: number[];
     airflow: number[];
   };
+  /**
+   * P3+: PLC tag quality 三态映射 (keyed by PLC tag name, e.g. 'TEMP_PV').
+   * 由 `pv_realtime` payload 的 `quality` 嵌套对象注入. 可选 — legacy server
+   * (P3 前) 或字段不在 broadcaster 映射表里则缺省.
+   */
+  qualityMap?: Record<string, TagQuality>;
 }
 
 const EMPTY_REACTOR_DATA: ReactorRuntimeData = {
@@ -225,6 +232,14 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
           const buf = get().trendBuffer;
           const MAX_POINTS = 3600;
           const pv = msg.payload as ProcessValues;
+          // SP-PLC-3 P3+: broadcaster 在 payload 加 `quality` 嵌套对象 (Record<plcTag,
+          // 'good'|'bad'|'uncertain'>). 透传到 reactorData.qualityMap 让 useTag 暴露
+          // 给 widget — 通讯断时 quality='bad' 但 value 保留 last-known-good, widget
+          // 可视觉提示 (灰色/划线/红框) 而非把 bad 值当 good 显示. legacy server (P3 前)
+          // payload 无 `quality`, qualityMap undefined, 旧消费者不破.
+          const qualityMap = (msg.payload as any).quality as
+            | Record<string, TagQuality>
+            | undefined;
           const nextTrend = {
             timestamps: [...buf.timestamps, msg.timestamp].slice(-MAX_POINTS),
             temperature: [...buf.temperature, msg.payload['AI-0'] ?? 0].slice(-MAX_POINTS),
@@ -233,15 +248,16 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
             rpm: [...buf.rpm, msg.payload.rpm ?? 0].slice(-MAX_POINTS),
             airflow: [...buf.airflow, msg.payload['AI-5'] ?? 0].slice(-MAX_POINTS),
           };
-          // legacy 顶层 (单反应器组件仍用)
+          // legacy 顶层 (单反应器组件仍用) — quality 不进顶层 state slot, 仅进 reactorData.
           set({ processValues: pv, trendBuffer: nextTrend });
-          // 反应器隔离写入
+          // 反应器隔离写入 (含 qualityMap)
           const rid = msg.reactor_id;
           if (rid) {
             const prevReactor = get().reactorData[rid] || EMPTY_REACTOR_DATA;
             const reactorTrend = prevReactor.trendBuffer;
             updateReactor(rid, {
               processValues: pv,
+              qualityMap,
               trendBuffer: {
                 timestamps: [...reactorTrend.timestamps, msg.timestamp].slice(-MAX_POINTS),
                 temperature: [...reactorTrend.temperature, msg.payload['AI-0'] ?? 0].slice(-MAX_POINTS),

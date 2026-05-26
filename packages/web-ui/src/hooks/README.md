@@ -7,7 +7,7 @@
 ### useTag
 
 ```tsx
-const { value, isStale, ageMs } = useTag('F01.AI-0');
+const { value, isStale, ageMs, quality } = useTag('F01.AI-0');
 const { value } = useTag('F01.AI-0', { staleMs: 10_000 });
 ```
 
@@ -15,6 +15,13 @@ const { value } = useTag('F01.AI-0', { staleMs: 10_000 });
 - `value: number | null` — 当下值, null 表 tag 不存在 / reactor 未连 / 从未收到 pv
 - `isStale: boolean` — true 当 age > staleMs (默认 5000) 或 value=null 或 WS 断
 - `ageMs: number` — 距 processValues.timestamp 毫秒数, Infinity 当无值
+- `quality?: 'good' | 'bad' | 'uncertain'` — SP-PLC-3 P3+ cache 三态. `undefined`
+  表示 quality 信息缺失 (legacy server, 或 field 不在 FIELD_TO_QUALITY_TAG 映射表里).
+  通讯断时 cache 会保 last-known-good value 但 quality 翻 'bad', widget 应用此字段
+  做视觉提示 (灰色/划线/红框) 而非把 bad 值当 good 显示.
+
+**Quality 映射 (Patch A 范围)**: `AI-0→TEMP_PV`, `AI-2→PH_PV`, `AI-3→DO_PV`,
+`AI-4→PRESSURE_PV`, `rpm→VFD_ACTUAL_FREQ`. 其它字段 quality undefined.
 
 ### useTagHistory
 
@@ -31,18 +38,37 @@ Options:
 - `windowSec?: number` — 历史时间窗口, 默认 60s
 - `staleMs?: number` — 数据年龄阈值, 默认 5000ms; 超出则 isStale=true
 
-## ⚠️ 生产 staleMs 注意
+## 生产 staleMs 设置
 
-`DEFAULT_STALE_MS = 5000` 假设 `pv_realtime` 频率 ~1Hz。 但 BIOCore server 当前 `reactor-wiring.ts` 的 tick 间隔为 **60 秒**, 因此生产环境下 widget 用默认 staleMs 会一直显示 stale。
+`DEFAULT_STALE_MS = 5000`. **SP-PLC-3 P3 (2026-05-25)** 之后 broadcaster 改 5Hz
+dirty-only fan-out (旧 reactor-wiring.ts 60s tick 已废), 默认值在生产环境合理 —
+约 5 个 tick + 4s 缓冲, widget 不传 staleMs 即可。
 
-**生产 widget 推荐**: 显式传 `{ staleMs: 70_000 }` (一个 tick + 10s 缓冲), 同时适用 useTag 和 useTagHistory。
+**旧建议 `{ staleMs: 70_000 }` 已过时**, 不要再传 70s, 否则通讯断后 widget 还会
+继续显示 stale=false 12 个 tick.
 
 ```tsx
-const { value, isStale } = useTag('F01.AI-0', { staleMs: 70_000 });
-const { points, isStale: histStale } = useTagHistory('F01.AI-0', { windowSec: 300, staleMs: 70_000 });
+// 推荐 — 用默认 staleMs
+const { value, isStale, quality } = useTag('F01.AI-0');
+const { points, isStale: histStale } = useTagHistory('F01.AI-0', { windowSec: 300 });
 ```
 
-未来若 server tick 调到 1Hz, 默认值即可。
+### Widget 按 quality 渲染示例
+
+```tsx
+const { value, isStale, quality } = useTag('F01.AI-0');
+
+// quality 三态视觉提示 (cache 保 last-known-good 时 quality='bad')
+const cls = quality === 'bad'
+  ? 'opacity-40 line-through text-red-500'      // 通讯故障
+  : quality === 'uncertain'
+    ? 'opacity-70 text-amber-500'                // 不确定
+    : isStale
+      ? 'opacity-50'                              // 数据陈旧
+      : '';                                       // 正常
+
+return <span className={cls}>{value?.toFixed(1) ?? '—'}</span>;
+```
 
 ## Tag Namespace
 

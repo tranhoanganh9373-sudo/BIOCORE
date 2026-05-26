@@ -34,3 +34,46 @@ describe('realtime-store scada channels', () => {
     });
   });
 });
+
+// SP-PLC-3 P3 follow-up Patch A: pv_realtime payload.quality 透传到
+// reactorData.qualityMap. WS onmessage handler 私有, 镜像 reducer 效果验.
+describe('realtime-store pv_realtime quality (Patch A)', () => {
+  beforeEach(() => {
+    useRealtimeStore.setState({ reactorData: {} });
+  });
+
+  it('pv_realtime payload 含 quality → reactorData[rid].qualityMap 写入', () => {
+    // 镜像 case 'pv_realtime' 内 updateReactor(rid, { processValues, qualityMap, ... })
+    // 的 reducer 效果. broadcaster shape: payload.quality = { TEMP_PV: 'good', PH_PV: 'bad', ... }
+    const rid = 'F01';
+    const qualityMap = {
+      TEMP_PV: 'good' as const,
+      PH_PV: 'bad' as const,
+      DO_PV: 'uncertain' as const,
+    };
+    useRealtimeStore.setState((s: any) => ({
+      reactorData: {
+        ...s.reactorData,
+        [rid]: {
+          processValues: { timestamp: '2026-05-26T10:00:00Z', 'AI-0': 37.5, 'AI-2': 7.0, 'AI-3': 80 },
+          stateUpdate: null,
+          calculatedParams: null,
+          alarms: [],
+          cusumAlerts: [],
+          cusumHistory: {},
+          softSensorData: null,
+          trendBuffer: { timestamps: [], temperature: [], pH: [], DO: [], rpm: [], airflow: [] },
+          qualityMap,
+        },
+      },
+    }));
+    const rd = useRealtimeStore.getState().reactorData[rid];
+    expect(rd.qualityMap).toEqual({
+      TEMP_PV: 'good',
+      PH_PV: 'bad',
+      DO_PV: 'uncertain',
+    });
+    // 旧字段不破
+    expect(rd.processValues?.['AI-0']).toBe(37.5);
+  });
+});

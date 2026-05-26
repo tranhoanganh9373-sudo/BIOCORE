@@ -31,12 +31,14 @@ function seedReactor(opts: {
   processValues?: any;
   wsConnected?: boolean;
   now?: number;
+  qualityMap?: Record<string, 'good' | 'bad' | 'uncertain'>;
 }) {
   const {
     reactorId = 'F01',
     processValues = null,
     wsConnected = true,
     now = Date.now(),
+    qualityMap,
   } = opts;
   useRealtimeStore.setState({
     wsConnected,
@@ -51,6 +53,7 @@ function seedReactor(opts: {
         cusumHistory: {},
         softSensorData: null,
         trendBuffer: { timestamps: [], temperature: [], pH: [], DO: [], rpm: [], airflow: [] },
+        qualityMap,
       },
     },
   });
@@ -185,5 +188,69 @@ describe('useTag', () => {
       useRealtimeStore.setState({ _tick: start + 2_000 });
     });
     expect(result.current.ageMs).toBeGreaterThanOrEqual(2_000);
+  });
+
+  // ─── SP-PLC-3 P3 follow-up Patch A: quality 透传 ────────────────────────
+  // 验 useTag 把 reactorData.qualityMap (由 broadcaster pv_realtime.payload.quality
+  // 注入) 通过 FIELD_TO_QUALITY_TAG 映射后暴露成 TagSnapshot.quality.
+
+  it('11. quality=good 时 useTag 返 quality=good', () => {
+    const now = Date.now();
+    vi.setSystemTime(now);
+    seedReactor({
+      processValues: { timestamp: new Date(now).toISOString(), 'AI-0': 37.5 },
+      now,
+      qualityMap: { TEMP_PV: 'good' },
+    });
+    const { result } = renderHook(() => useTag('F01.AI-0'));
+    expect(result.current.value).toBe(37.5);
+    expect(result.current.quality).toBe('good');
+  });
+
+  it('12. quality=bad + value 保留 last-known-good → quality=bad + value 非 null', () => {
+    // 模拟 P3 cache 通讯故障行为: tagCache 返 last-known-good value + quality=bad,
+    // broadcaster 把 quality 透传给前端. useTag 应同时暴露 value (用于显示上次值)
+    // 和 quality=bad (用于视觉提示).
+    const now = Date.now();
+    vi.setSystemTime(now);
+    seedReactor({
+      processValues: { timestamp: new Date(now).toISOString(), 'AI-2': 7.2 },
+      now,
+      qualityMap: { PH_PV: 'bad' },
+    });
+    const { result } = renderHook(() => useTag('F01.AI-2'));
+    expect(result.current.value).toBe(7.2);
+    expect(result.current.value).not.toBeNull();
+    expect(result.current.quality).toBe('bad');
+  });
+
+  it('13. legacy server 无 qualityMap → quality undefined', () => {
+    // P3 前 server 不带 payload.quality, store 写入 qualityMap=undefined.
+    // 旧消费者 destructure { value, isStale, ageMs } 完全不破.
+    const now = Date.now();
+    vi.setSystemTime(now);
+    seedReactor({
+      processValues: { timestamp: new Date(now).toISOString(), 'AI-0': 37.5 },
+      now,
+      // qualityMap 不传 → undefined
+    });
+    const { result } = renderHook(() => useTag('F01.AI-0'));
+    expect(result.current.value).toBe(37.5);
+    expect(result.current.quality).toBeUndefined();
+  });
+
+  it('14. AI-1 不在 FIELD_TO_QUALITY_TAG 映射 → quality undefined (即使 qualityMap 含 TEMP_PV)', () => {
+    // Patch A 范围保守 — 仅 AI-0/AI-2/AI-3/AI-4/rpm 映射. AI-1/AI-5/AI-6/AO_cv
+    // 等不映射, useTag 返 quality undefined 即使 qualityMap 含其它 tag.
+    const now = Date.now();
+    vi.setSystemTime(now);
+    seedReactor({
+      processValues: { timestamp: new Date(now).toISOString(), 'AI-1': 22.3 },
+      now,
+      qualityMap: { TEMP_PV: 'good', JACKET_PV: 'bad' },
+    });
+    const { result } = renderHook(() => useTag('F01.AI-1'));
+    expect(result.current.value).toBe(22.3);
+    expect(result.current.quality).toBeUndefined();
   });
 });
