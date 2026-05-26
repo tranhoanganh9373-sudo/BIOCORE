@@ -166,13 +166,6 @@ export function createReactorWiring(deps: ReactorWiringDeps): ReactorWiringHandl
         if (MOCK_PLC || !pollingSchedulers?.get(reactorId)) {
           tagCache.write(reactorId, buildMockSnapshot(TAGS, reactorId));
         }
-        const entries = tagCache.readAll(reactorId);
-        const rawPV: Record<string, number> = {};
-        for (const tag of TAGS) {
-          const entry = entries[tag];
-          rawPV[tag] = entry ? entry.value : 0;
-        }
-        const rpmRaw = rawPV['VFD_ACTUAL_FREQ'] * 24;
 
         // SP-PLC-3 P3 (plan §1 Commit 3): 已拆出
         //   - InfluxDB Point 写入   → startInfluxFlusher (engine/influx-flusher.ts, 1Hz)
@@ -182,13 +175,30 @@ export function createReactorWiring(deps: ReactorWiringDeps): ReactorWiringHandl
         // ─── CUSUM 实时异常检测 ───────────────────────────
         if (batchId !== 'idle') {
           const detMap = getCusumKey(batchId);
-          const pvMap: Record<string, number> = {
-            temperature: rawPV['TEMP_PV'],
-            pH: rawPV['PH_PV'],
-            DO: rawPV['DO_PV'],
-            pressure: rawPV['PRESSURE_PV'],
-            rpm: rpmRaw,
-          };
+
+          // SP-PLC-3 P4 (plan §1 Commit 4): pvMap 从 TagCache 读, 不再依赖
+          // 同 tick 内 rawPV 闭包 (rawPV 已删除, 见上面 cache.write 之后).
+          // quality='bad' 的 channel 直接 skip — 不进 pvMap, 不污染 CUSUM
+          // 检测器历史 state (旧路径用 catch→0 兜底会把 0 当作真实值喂进
+          // detector 累积偏差, 通讯断恢复后产生大量虚假告警).
+          const cusumTags = ['TEMP_PV', 'PH_PV', 'DO_PV', 'PRESSURE_PV', 'VFD_ACTUAL_FREQ'];
+          const cusumEntries = tagCache.readMany(reactorId, cusumTags);
+          const tagToChannel: ReadonlyArray<[string, string]> = [
+            ['TEMP_PV', 'temperature'],
+            ['PH_PV', 'pH'],
+            ['DO_PV', 'DO'],
+            ['PRESSURE_PV', 'pressure'],
+            ['VFD_ACTUAL_FREQ', 'rpm'],
+          ];
+          const pvMap: Record<string, number> = {};
+          for (const [tag, channel] of tagToChannel) {
+            const entry = cusumEntries[tag];
+            if (entry && entry.quality === 'good') {
+              // rpm = VFD_ACTUAL_FREQ × 24 转换, 与旧 rpmRaw 一致.
+              pvMap[channel] = channel === 'rpm' ? entry.value * 24 : entry.value;
+            }
+          }
+
           const cusumResults: Array<{
             channel: string; anomaly: boolean; deviation: number;
             alarming: boolean; cumPos: number; cumNeg: number;
