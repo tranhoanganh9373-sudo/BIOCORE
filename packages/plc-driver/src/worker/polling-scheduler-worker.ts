@@ -1,17 +1,19 @@
 // ============================================================
-// SP-PLC-3 P3b.1: PollingScheduler worker_threads 入口
+// SP-PLC-3 P3b.2: PollingScheduler worker_threads 入口 (真 snap7 路径)
 //
 // 在 worker context 内运行 polling 调度循环，通过 parentPort IPC 与 main
 // thread 交换控制消息 + snapshot 数据，避免 main event loop 被 PLC I/O 阻塞。
 //
-// 当前 P3b.1 (scaffold) 路径：
-//   - 不连真 snap7，每 tick 用 buildMockSnapshot 生成假 ProcessSnapshot
-//   - 验证 IPC 协议端到端：init/addVariable/removeVariable/stop ↔ snapshot/state/error
+// P3b.2 路径（生产）:
+//   - 在 worker isolate 内 new PLCConnectionManager(plcConfig) + connect()
+//   - 用 P3a.3 PollingScheduler (复用 region 批量读 + groupByRate + dirty flag +
+//     pollGroup 全套逻辑), 把它的 'snapshot' / 'error' 事件桥接到 IPC postMessage
+//   - main thread 不再持 native snap7 binding, worker isolate 隔离崩溃半径
 //
-// 下游 P3b.2：替换 buildMockSnapshot → 真 PLCConnectionManager.connect + readBytesRaw
-// (worker 内构造 connection, snap7 native binding 在 worker isolate 内独立加载)。
+// P3b.1 mock 路径 (buildMockSnapshot + 自管 setInterval) 已删除, 由 PollingScheduler
+// 接管所有调度. addVariable / removeVariable 直接转发到 PollingScheduler 增量 API.
 //
-// IPC 协议（详 plan §1 Commit 1 line 60-76）：
+// IPC 协议（详 plan §1 Commit 1 line 60-76, P3b.2 不改）:
 //   main → worker:
 //     { type: 'init',           reactorId, plcConfig, variables, pollRates }
 //     { type: 'addVariable',    variable }
@@ -24,6 +26,7 @@
 // ============================================================
 
 import { parentPort } from 'worker_threads';
+import { PLCConnectionManager, PollingScheduler } from '../index';
 import type { PLCConnectionConfig, PLCVariableMapping, ProcessSnapshot } from '../types';
 
 if (!parentPort) {
@@ -34,15 +37,8 @@ const port = parentPort;
 
 // ─── worker 内部状态 ─────────────────────────────────────────
 let reactorId = '';
-// plcConfig 在 P3b.1 仅存储 (mock 路径不使用)；P3b.2 用于 PLCConnectionManager 构造
-let plcConfig: PLCConnectionConfig | null = null;
-let variables: PLCVariableMapping[] = [];
-let pollRates: number[] = [];
-const timers: Map<number, ReturnType<typeof setInterval>> = new Map();
-let running = false;
-
-// 在 worker 内显式标注未使用变量 (P3b.2 启用), 避免 lint
-void plcConfig;
+let mgr: PLCConnectionManager | null = null;
+let scheduler: PollingScheduler | null = null;
 
 // ─── 消息处理 ────────────────────────────────────────────────
 interface InitMsg {
@@ -50,7 +46,11 @@ interface InitMsg {
   reactorId: string;
   plcConfig: PLCConnectionConfig;
   variables: PLCVariableMapping[];
-  pollRates: number[];
+  /**
+   * P3b.1 协议字段; P3b.2 不再使用 (PollingScheduler 内部按 var.poll_rate_ms
+   * 自动 group + 启 timer). 保留接收以兼容 P3b.1 caller, 静默忽略.
+   */
+  pollRates?: number[];
 }
 interface AddVarMsg { type: 'addVariable'; variable: PLCVariableMapping }
 interface RemoveVarMsg { type: 'removeVariable'; id: string }
@@ -58,35 +58,26 @@ interface StopMsg { type: 'stop' }
 type InboundMsg = InitMsg | AddVarMsg | RemoveVarMsg | StopMsg;
 
 port.on('message', (msg: InboundMsg) => {
+  void handleMessage(msg);
+});
+
+async function handleMessage(msg: InboundMsg): Promise<void> {
   try {
     switch (msg.type) {
       case 'init':
-        reactorId = msg.reactorId;
-        plcConfig = msg.plcConfig;
-        variables = [...(msg.variables ?? [])];
-        pollRates = [...(msg.pollRates ?? [1000])];
-        startTimers();
-        port.postMessage({ type: 'state', state: 'running' });
+        await handleInit(msg);
         break;
 
       case 'addVariable':
-        variables.push(msg.variable);
-        // 若新 var 的 poll_rate 尚未注册 timer, 启之 (动态扩展 rate 集)
-        if (typeof msg.variable.poll_rate_ms === 'number') {
-          ensureTimerForRate(msg.variable.poll_rate_ms);
-        }
+        if (scheduler) scheduler.addVariable(msg.variable);
         break;
 
       case 'removeVariable':
-        variables = variables.filter((v) => v.id !== msg.id);
-        // 注：不主动 stop timer (空 rate 在 tick 内会 if(vars.length===0) return 跳过 emit)
-        // 保持与 PollingScheduler P3a.3 行为一致：避免短时移除 + 再加触发空窗
+        if (scheduler) scheduler.removeVariable(msg.id);
         break;
 
       case 'stop':
-        stopTimers();
-        port.postMessage({ type: 'state', state: 'stopped' });
-        // 让 main thread 决定何时 worker.terminate (P3b 决策 Q5: 5s 超时强 kill)
+        await handleStop();
         break;
     }
   } catch (err) {
@@ -95,62 +86,53 @@ port.on('message', (msg: InboundMsg) => {
       message: err instanceof Error ? err.message : String(err),
     });
   }
-});
-
-// ─── timer 管理 ──────────────────────────────────────────────
-function startTimers(): void {
-  if (running) return;
-  running = true;
-  for (const rate of pollRates) ensureTimerForRate(rate);
 }
 
-function ensureTimerForRate(rate: number): void {
-  if (timers.has(rate)) return;
-  const timer = setInterval(() => onTick(rate), rate);
-  timers.set(rate, timer);
-}
-
-function stopTimers(): void {
-  running = false;
-  for (const t of timers.values()) clearInterval(t);
-  timers.clear();
-}
-
-function onTick(rate: number): void {
-  if (!running) return;
-  const varsForRate = variables.filter(
-    (v) => v.poll_rate_ms === rate && v.enabled && v.direction !== 'WRITE',
-  );
-  if (varsForRate.length === 0) return;
+// ─── init: 建立 PLC 连接 + 启 PollingScheduler ───────────────
+async function handleInit(msg: InitMsg): Promise<void> {
+  reactorId = msg.reactorId;
+  port.postMessage({ type: 'state', state: 'connecting' });
   try {
-    // P3b.1 mock 路径：生成随机 snapshot 验证 IPC
-    // P3b.2 替换为：const snap = await mgr.pollGroup(varsForRate)
-    const snap = buildMockSnapshot(varsForRate);
-    port.postMessage({ type: 'snapshot', reactorId, snap });
+    mgr = new PLCConnectionManager(msg.plcConfig);
+    // 把 caller 传入的 vars 注入 mgr (PollingScheduler 启动时会
+    // lazy snapshot mgr.getVariableList() 作初始集; 这里显式 setVariables
+    // 跟 P3a.3 main thread 路径 index.ts:3758 行为一致).
+    mgr.setVariables(msg.variables ?? []);
+    await mgr.connect();
+
+    scheduler = new PollingScheduler(mgr);
+    // 把 scheduler 'snapshot' 桥接到 IPC. PollingScheduler 内 pollGroup 已含
+    // region 批量读 + raw_values + quality 全套逻辑, worker 仅 forward.
+    scheduler.on('snapshot', (snap: ProcessSnapshot) => {
+      port.postMessage({ type: 'snapshot', reactorId, snap });
+    });
+    scheduler.on('error', (err: unknown) => {
+      port.postMessage({
+        type: 'error',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    });
+    scheduler.start();
+    port.postMessage({ type: 'state', state: 'running' });
   } catch (err) {
     port.postMessage({
       type: 'error',
       message: err instanceof Error ? err.message : String(err),
     });
+    port.postMessage({ type: 'state', state: 'failed' });
   }
 }
 
-// ─── mock snapshot (P3b.1 only, P3b.2 删) ────────────────────
-function buildMockSnapshot(vars: PLCVariableMapping[]): ProcessSnapshot {
-  const values: Record<string, number> = {};
-  const raw_values: Record<string, number> = {};
-  const quality: Record<string, 'good' | 'bad' | 'uncertain'> = {};
-  for (const v of vars) {
-    const raw = Math.random() * 100;
-    raw_values[v.tag_name] = raw;
-    values[v.tag_name] = raw;
-    quality[v.tag_name] = 'good';
+// ─── stop: 平稳停 scheduler + 断开 PLC ──────────────────────
+async function handleStop(): Promise<void> {
+  if (scheduler) {
+    try { scheduler.stop(); } catch { /* ignore */ }
+    scheduler = null;
   }
-  return {
-    timestamp: new Date().toISOString(),
-    connection_id: reactorId, // P3b.1: 用 reactorId 占位; P3b.2 用 plcConfig.id
-    values,
-    raw_values,
-    quality,
-  };
+  if (mgr) {
+    try { await mgr.disconnect(); } catch { /* ignore */ }
+    mgr = null;
+  }
+  port.postMessage({ type: 'state', state: 'stopped' });
+  // worker 不自退出, 等 main thread terminate() (P3b 决策 Q5: 5s 超时强 kill)
 }

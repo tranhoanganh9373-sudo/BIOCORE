@@ -76,6 +76,15 @@ export interface CacheMetricsHandle {
    * Buckets 复用 services/metrics 固定 `[0.01, 0.05, 0.1, 0.5, 1, 5]` 秒.
    */
   fanoutHistogram: Histogram;
+  /**
+   * SP-PLC-3 P3b.2: per-reactor worker_threads PollingScheduler 状态 Gauge.
+   * 1 = worker 'running', 0 = 'stopped' / 'failed' / 'connecting' / 降级 mock.
+   * Caller (index.ts startup) 在 worker.on('state') 内调
+   * `(state) => handle.plcWorkerState.set(state === 'running' ? 1 : 0, { reactor })`
+   * 注入. PLC_WORKER_DISABLED=true (main thread 路径) 不写此 gauge,
+   * 留 0 即等价 "无 worker 状态可报", 跟 worker spawn 失败语义一致.
+   */
+  plcWorkerState: Gauge;
   /** 停止采样 / 解订阅. 重复调用安全. */
   stop: () => void;
 }
@@ -113,6 +122,11 @@ export function registerCacheMetrics(deps: CacheMetricsDeps): CacheMetricsHandle
   const fanoutHistogram = deps.registry.histogram(
     'biocore_broadcaster_fanout_seconds',
     'Broadcaster tick fan-out latency in seconds (cache change → all client fan-out completed)',
+  );
+  // SP-PLC-3 P3b.2: worker PollingScheduler state gauge (per reactor).
+  const plcWorkerState = deps.registry.gauge(
+    'biocore_plc_worker_state',
+    'PLC worker thread state per reactor (1=running, 0=stopped/failed/fallback)',
   );
 
   // 接 TagCache fan-out (callback 仅在 sameValue=false 时触发, 即 deadband 通过).
@@ -158,5 +172,5 @@ export function registerCacheMetrics(deps: CacheMetricsDeps): CacheMetricsHandle
     deps.tagCache.unsubscribe(subId);
   };
 
-  return { writesTotal, sizeGauge, dirtyTotal, skippedTotal, fanoutHistogram, stop };
+  return { writesTotal, sizeGauge, dirtyTotal, skippedTotal, fanoutHistogram, plcWorkerState, stop };
 }

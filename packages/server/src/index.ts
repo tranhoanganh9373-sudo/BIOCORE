@@ -3270,15 +3270,22 @@ import { TagCache, type DeadbandResolver } from './engine/tag-cache';
 // 仅引 type, 避免顶层 import 触发 @biocore/plc-driver 主 entry 加载
 // (含 node-snap7 native binding, dev/test 环境无 native build 会 crash).
 // 真实实例由 start() 内 dynamic import 创建, 仅 MOCK_PLC=false 走此路径.
-import type { PollingScheduler } from '@biocore/plc-driver';
+import type { PollingScheduler, WorkerHandle } from '@biocore/plc-driver';
 const tagCache = new TagCache();
 const pollingSchedulers = new Map<string, PollingScheduler>();
+// SP-PLC-3 P3b.2: per-reactor worker_threads PollingScheduler handle.
+// 默认路径（PLC_WORKER_DISABLED 未设 / != 'true'）走 worker; 设 true 时
+// fall back 到 main thread pollingSchedulers (hot-rollback 通道).
+const pollingWorkers = new Map<string, WorkerHandle>();
 
 // SP-PLC-3 P2.5: cache 监控指标. 必须在 createReactorWiring 之前注册, 因为
 // wiring 的 mock 路径 (reactor-wiring.ts:167) 调 onCacheWrite 回调累计
 // biocore_tagcache_writes_total. cache-metrics 仅依赖 tagCache + reactorManager
 // + metricsRegistry, 都已在 module 顶端 available.
 import { registerCacheMetrics } from './engine/cache-metrics';
+// SP-PLC-3 P3b.2: per-reactor worker launcher + shutdown helpers (抽到独立
+// 模块便于 worker-lifecycle.test.ts 单测 backoff/降级/SIGTERM 路径).
+import { launchPlcWorkerForReactor, shutdownPlcWorkers } from './engine/plc-worker-launcher';
 const cacheMetrics = registerCacheMetrics({
   registry: metricsRegistry,
   tagCache,
@@ -3714,17 +3721,25 @@ async function start(): Promise<void> {
   process.on('SIGTERM', () => scadaDispatcherHandle.stop());
   process.on('SIGINT', () => scadaDispatcherHandle.stop());
 
-  // ─── SP-PLC-3 P2: PollingScheduler 启动 (plan §1 Commit 2 + §2a) ───
+  // ─── SP-PLC-3 P2 + P3b.2: PollingScheduler 启动 ─────────────────────
   // 仅生产模式启动 (MOCK_PLC=true 时 reactor-wiring 走 buildMockSnapshot,
   // 跟 plan §6 Q-v 候选 A 一致). 动态 import 隔离 native binding 加载:
   // dev 环境 (无 node-snap7 native build) 不会因 require 期错误而 crash.
-  // 失败的 reactor 自动退化 mock 路径 (Promise.allSettled + try/catch).
+  //
+  // P3b.2 双路径 (plan §1 Commit 2 + §6 Q(iv)):
+  //   - 默认 (PLC_WORKER_DISABLED 未设 / != 'true'): 走 worker_threads 路径,
+  //     PLC IO 在 worker isolate, main loop 不被 native binding 阻塞.
+  //     spawn 失败 → 1s/2s/4s exponential backoff 最多 3 次, 失败后降级
+  //     "不写新数据 + plcWorkerState gauge=0", 老缓存仍可读 (Q(iv) 候选 A).
+  //   - PLC_WORKER_DISABLED=true: hot-rollback 到 P3a.3 main thread
+  //     PollingScheduler 路径 (保留 100% 旧 wiring, 0 行为差).
+  const PLC_WORKER_DISABLED = (process.env.PLC_WORKER_DISABLED ?? '').toLowerCase() === 'true';
   if (!MOCK_PLC) {
     try {
       const plcDriver = await import('@biocore/plc-driver');
-      const { PLCConnectionManager, PollingScheduler } = plcDriver;
+      const { PLCConnectionManager, PollingScheduler, startSchedulerInWorker } = plcDriver;
       const reactors = reactorManager.listReactors();
-      // ─── SP-PLC-3 P2.2: per-tag deadband resolver ───────────────
+      // ─── SP-PLC-3 P2.2: per-tag deadband resolver (双路径共用) ──────
       // 从 plc_variable_mappings.deadband_abs/_pct (P2.1 migration 040) 读
       // per-tag 配置, abs/pct 均 0 = 关闭 per-tag → tag-cache 回退全局
       // deadband (默认 0 = Phase 1 全推行为). 仅注入到真实 PLC 路径
@@ -3742,50 +3757,94 @@ async function start(): Promise<void> {
           pct: mapping.deadband_pct ?? 0,
         };
       };
-      const startPromises = reactors.map(async (reactor) => {
-        try {
-          // plan §B getReactorPLCConnection helper 不存在 — 走现有
-          // sqlite.getPlcReactorBindingsByReactor + varManager.getConnections 组合.
-          const bindings = sqlite.getPlcReactorBindingsByReactor(reactor.id);
-          if (bindings.length === 0) return;  // 无 PLC 绑定 → 走 mock 路径
-          const plcId = bindings[0].plc_id;
-          const conn = varManager.getConnections().find((c: PLCConnectionConfig) => c.id === plcId);
-          if (!conn) {
-            console.warn(`[${new Date().toISOString()}] [WARN] [scheduler:${reactor.id}] plc_id=${plcId} 未在 plc_connections 表找到, 退化 mock 路径`);
-            return;
+
+      if (!PLC_WORKER_DISABLED) {
+        // ─── P3b.2 worker_threads 路径 (默认) ────────────────────────
+        // 逻辑抽到 engine/plc-worker-launcher.ts 便于单测验证生命周期.
+        const startPromises = reactors.map(async (reactor) => {
+          try {
+            const bindings = sqlite.getPlcReactorBindingsByReactor(reactor.id);
+            if (bindings.length === 0) return;
+            const plcId = bindings[0].plc_id;
+            const conn = varManager.getConnections().find((c: PLCConnectionConfig) => c.id === plcId);
+            if (!conn) {
+              console.warn(`[${new Date().toISOString()}] [WARN] [plc-worker:${reactor.id}] plc_id=${plcId} 未在 plc_connections 表找到, 退化 mock 路径`);
+              return;
+            }
+            launchPlcWorkerForReactor(
+              { reactorId: reactor.id, plcConfig: conn, variables: varManager.getVariables(plcId) },
+              {
+                startSchedulerInWorker,
+                onSnapshot: (rid, snap) => {
+                  cacheMetrics.writesTotal.inc();
+                  tagCache.write(rid, snap, { deadbandResolver });
+                },
+                onWorkerState: (rid, state) => {
+                  cacheMetrics.plcWorkerState.set(state === 'running' ? 1 : 0, { reactor: rid });
+                },
+                onMarkStale: (rid) => tagCache.markStale(rid),
+              },
+              (handle) => {
+                if (handle) pollingWorkers.set(reactor.id, handle);
+                else pollingWorkers.delete(reactor.id);
+              },
+            );
+          } catch (err) {
+            console.warn(`[${new Date().toISOString()}] [WARN] [plc-worker:${reactor.id}] 启动失败, 退化 mock 路径:`, (err as Error).message);
           }
-          const mgr = new PLCConnectionManager(conn);
-          mgr.setVariables(varManager.getVariables(plcId));
-          await mgr.connect();
-          const scheduler = new PollingScheduler(mgr);
-          // SP-PLC-3 P2.2: 把 deadbandResolver 注入 write opts, 让 P2.1 ship 的
-          // per-tag deadband 真正作用于 cache → broadcaster (dirty-only) +
-          // flusher (lastChanged-only) 双路径.
-          scheduler.on('snapshot', (snap: any) => {
-            // SP-PLC-3 P2.5: 显式 inc writesTotal (含 deadband 抑制的 write — 与 metric 命名一致).
-            cacheMetrics.writesTotal.inc();
-            tagCache.write(reactor.id, snap, { deadbandResolver });
-          });
-          scheduler.on('error', (err: any) => {
-            console.error(`[${new Date().toISOString()}] [ERROR] [scheduler:${reactor.id}]`, err);
-            tagCache.markStale(reactor.id);
-          });
-          scheduler.start();
-          pollingSchedulers.set(reactor.id, scheduler);
-          console.log(`[${new Date().toISOString()}] [INFO] [scheduler:${reactor.id}] PollingScheduler 已启动 (plc_id=${plcId})`);
-        } catch (err) {
-          console.warn(`[${new Date().toISOString()}] [WARN] [scheduler:${reactor.id}] 启动失败, 退化 mock 路径:`, (err as Error).message);
-        }
-      });
-      await Promise.allSettled(startPromises);
+        });
+        await Promise.allSettled(startPromises);
+      } else {
+        // ─── P3a.3 main thread 路径 (PLC_WORKER_DISABLED=true hot-rollback) ──
+        const startPromises = reactors.map(async (reactor) => {
+          try {
+            // plan §B getReactorPLCConnection helper 不存在 — 走现有
+            // sqlite.getPlcReactorBindingsByReactor + varManager.getConnections 组合.
+            const bindings = sqlite.getPlcReactorBindingsByReactor(reactor.id);
+            if (bindings.length === 0) return;  // 无 PLC 绑定 → 走 mock 路径
+            const plcId = bindings[0].plc_id;
+            const conn = varManager.getConnections().find((c: PLCConnectionConfig) => c.id === plcId);
+            if (!conn) {
+              console.warn(`[${new Date().toISOString()}] [WARN] [scheduler:${reactor.id}] plc_id=${plcId} 未在 plc_connections 表找到, 退化 mock 路径`);
+              return;
+            }
+            const mgr = new PLCConnectionManager(conn);
+            mgr.setVariables(varManager.getVariables(plcId));
+            await mgr.connect();
+            const scheduler = new PollingScheduler(mgr);
+            // SP-PLC-3 P2.2: 把 deadbandResolver 注入 write opts, 让 P2.1 ship 的
+            // per-tag deadband 真正作用于 cache → broadcaster (dirty-only) +
+            // flusher (lastChanged-only) 双路径.
+            scheduler.on('snapshot', (snap: any) => {
+              // SP-PLC-3 P2.5: 显式 inc writesTotal (含 deadband 抑制的 write — 与 metric 命名一致).
+              cacheMetrics.writesTotal.inc();
+              tagCache.write(reactor.id, snap, { deadbandResolver });
+            });
+            scheduler.on('error', (err: any) => {
+              console.error(`[${new Date().toISOString()}] [ERROR] [scheduler:${reactor.id}]`, err);
+              tagCache.markStale(reactor.id);
+            });
+            scheduler.start();
+            pollingSchedulers.set(reactor.id, scheduler);
+            console.log(`[${new Date().toISOString()}] [INFO] [scheduler:${reactor.id}] PollingScheduler (main thread, PLC_WORKER_DISABLED) 已启动 (plc_id=${plcId})`);
+          } catch (err) {
+            console.warn(`[${new Date().toISOString()}] [WARN] [scheduler:${reactor.id}] 启动失败, 退化 mock 路径:`, (err as Error).message);
+          }
+        });
+        await Promise.allSettled(startPromises);
+      }
     } catch (err) {
       console.warn(`[${new Date().toISOString()}] [WARN] [scheduler] 模块加载失败 (可能 native binding 缺失), 全部 reactor 退化 mock 路径:`, (err as Error).message);
     }
   }
-  // SIGTERM/SIGINT: 停止所有 PollingScheduler 的 setInterval timer
-  // (跟现有 gracefulShutdown / scadaDispatcher 钩子并存, 各 handler 独立).
+  // SIGTERM/SIGINT: 停止所有 PollingScheduler / PLC worker.
+  // - main thread scheduler.stop() 同步 clearInterval
+  // - worker: stop() 发 IPC 让 worker clear timer + disconnect PLC, 5s 超时
+  //   后 terminate() 强 kill (snap7 native handle 可能不释放, plan §2d 接受)
   process.on('SIGTERM', () => pollingSchedulers.forEach((s) => s.stop()));
   process.on('SIGINT', () => pollingSchedulers.forEach((s) => s.stop()));
+  process.on('SIGTERM', () => { void shutdownPlcWorkers(pollingWorkers).then(() => pollingWorkers.clear()); });
+  process.on('SIGINT', () => { void shutdownPlcWorkers(pollingWorkers).then(() => pollingWorkers.clear()); });
   server.listen(PORT, () => {
   console.log(`
   ╔══════════════════════════════════════════════╗
