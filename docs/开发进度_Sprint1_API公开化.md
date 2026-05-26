@@ -257,10 +257,10 @@ biocore 已确定独立产品定位:**实验室发酵罐控制 + 时序数据采
 **目的:** 不删除 devValues(否则没真实 PLC 时演示无法用),改为环境变量控制,生产强制禁用 + 启动时显眼警告。
 
 ### 任务清单
-- [ ] **7.1** `packages/server/src/index.ts` 提取顶层 `const MOCK_PLC = process.env.MOCK_PLC === 'true'`(若 `devPlcRead` 已是顶层函数则只加常量),启动时若 `MOCK_PLC=true` 在控制台打印多行红色警告框
-- [ ] **7.2** 修改两处 reactor 注册的 `plcRead` 闭包(line ~1267 和 ~1209) — `if (MOCK_PLC) return devPlcRead(tag); else throw new Error('PLC 未连接...')`
-- [ ] **7.3** `.env` 加 `MOCK_PLC=true`(开发演示默认开启)
-- [ ] **7.4** `docs/部署说明.md` 创建或更新,明确"生产部署必须 MOCK_PLC=false"
+- [x] **7.1** `packages/server/src/index.ts` 提取顶层 `const MOCK_PLC = process.env.MOCK_PLC === 'true'`(若 `devPlcRead` 已是顶层函数则只加常量),启动时若 `MOCK_PLC=true` 在控制台打印多行红色警告框 — 完成于 2026-05-25(MOCK_PLC + devPlcRead 在 v1.9.0 P2 重构后位于 `plc-bridge.ts:42-58`,index.ts 从 barrel 导入;本次补 ANSI `\x1b[1;31m` 红色加粗 + TTY 检测)
+- [x] **7.2** 修改两处 reactor 注册的 `plcRead` 闭包(line ~1267 和 ~1209) — `if (MOCK_PLC) return devPlcRead(tag); else throw new Error('PLC 未连接...')` — 完成于 2026-05-25(post-v1.12 route-handler-split 把两处闭包合并为 `buildReactorConfig` 单工厂 `index.ts:3263-3269`,逻辑符合 spec)
+- [x] **7.3** `.env` 加 `MOCK_PLC=true`(开发演示默认开启) — 完成于 2026-05-25(仓库根 `.env` 新建,gitignore 已忽略;`packages/server/src/_env.ts:loadEnvEarly()` 会扫 `process.cwd()/.env` + `../../.env` 自动加载)
+- [x] **7.4** `docs/部署说明.md` 创建或更新,明确"生产部署必须 MOCK_PLC=false" — 完成于 2026-05-25(SP-FX-37 已交付 §5.1 MOCK_PLC 必须禁用 + line 31 环境变量表 + line 53 启动告警提示,本次复核无新增)
 
 **关键文件路径:**
 - 修改: `packages/server/src/index.ts`(2 处 plcRead 闭包 + 顶层启动警告)

@@ -38,14 +38,18 @@ export { parseAddr, byteLen, decode, scale, validateAddr, VariableMappingManager
 export type { PLCConnectionConfig, PLCVariableMapping, WritePrep, WriteSuccess };
 
 // MOCK_PLC: 默认 false (生产安全), 开发演示需在 .env 设置 MOCK_PLC=true
-// 开启后所有 plcRead 调用返回模拟值, 启动时打印多行警告框
+// 开启后所有 plcRead 调用返回模拟值, 启动时打印多行红色警告框
+// Sprint1 M7.1: ANSI 红色加粗码 (\x1b[1;31m...\x1b[0m), TTY 检测避免日志文件中残留转义码
 export const MOCK_PLC = process.env.MOCK_PLC === 'true';
 if (MOCK_PLC) {
+  const useColor = process.stderr.isTTY && !process.env.NO_COLOR;
+  const red = useColor ? '\x1b[1;31m' : '';
+  const reset = useColor ? '\x1b[0m' : '';
   console.warn('');
-  console.warn('  ╔══════════════════════════════════════════════════════╗');
-  console.warn('  ║  ⚠ MOCK_PLC=true 模式启用 — 所有 PLC 读取返回模拟值  ║');
-  console.warn('  ║  生产部署前必须设置 MOCK_PLC=false 或移除该环境变量  ║');
-  console.warn('  ╚══════════════════════════════════════════════════════╝');
+  console.warn(`  ${red}╔══════════════════════════════════════════════════════╗${reset}`);
+  console.warn(`  ${red}║  ⚠ MOCK_PLC=true 模式启用 — 所有 PLC 读取返回模拟值  ║${reset}`);
+  console.warn(`  ${red}║  生产部署前必须设置 MOCK_PLC=false 或移除该环境变量  ║${reset}`);
+  console.warn(`  ${red}╚══════════════════════════════════════════════════════╝${reset}`);
   console.warn('');
 }
 
