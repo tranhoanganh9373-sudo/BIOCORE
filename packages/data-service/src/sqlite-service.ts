@@ -543,6 +543,20 @@ export class SQLiteService {
     this.db.prepare(`UPDATE ws_message_queue SET status='pending' WHERE status='dispatching'`).run();
   }
 
+  /**
+   * SP-PLC-3 P3c.5: 按 status 聚合 ws_message_queue 行数. 给 cache-metrics
+   * biocore_ws_queue_size{status} Gauge 30s 周期采样用. 返键为状态字符串,
+   * 值为 row 数. 仅含表中已存在的 status, 缺的状态由 caller 补 0.
+   */
+  countWsMessagesByStatus(): Record<string, number> {
+    const rows = this.db.prepare(
+      `SELECT status, COUNT(*) AS n FROM ws_message_queue GROUP BY status`,
+    ).all() as Array<{ status: string; n: number }>;
+    const out: Record<string, number> = {};
+    for (const r of rows) out[r.status] = r.n;
+    return out;
+  }
+
   getPendingSuggestionsBySource(batchId?: string, sourceModule?: string): any[] {
     const clauses: string[] = ["status = 'pending'"];
     const params: any[] = [];

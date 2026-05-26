@@ -701,6 +701,16 @@ const mqttPublisher = createMqttPublisher({
 // 本 module 后段才 register (依赖 tagCache, 须先于 reactorManager wiring), 此处
 // 用 mutable ref 延迟绑定. cache-metrics register 后赋值 → 后续 skip 才会累计.
 let onWsSkip: ((reason: 'no-subscription') => void) | null = null;
+// SP-PLC-3 P3c.5: ack latency hook mutable ref. cache-metrics 注册后赋值为
+// (s) => cacheMetrics.wsAckLatencySeconds.observe(s); 在此之前 ack 仍走
+// markAckReceived 路径但不 observe Histogram (Histogram 计数会缺前几秒数据,
+// 不影响正确性).
+let onWsAckLatency: ((seconds: number) => void) | null = null;
+// SP-PLC-3 P3c.5: 动态 import markAckReceived (避免 module-load 顺序问题).
+// 实际 import 在 module 顶端已通过 './engine/ws-message-queue' (CRITICAL_CHANNELS
+// 等), 此处仅引入 markAckReceived 名字. 在 createWsServer.opts.markAckReceived
+// 闭包内调 markAckReceived(sqlite, msgId, { onAckLatency }) 接 latency 钩子.
+import { markAckReceived as wsQueueMarkAck } from './engine/ws-message-queue';
 
 const { wss, broadcast } = createWsServer({
   server,
@@ -710,6 +720,18 @@ const { wss, broadcast } = createWsServer({
   mqttPublisher,
   // 延迟到 cache-metrics 注册后真正生效; ref 仍为 null 时为 noop.
   onSkip: (reason) => { onWsSkip?.(reason); },
+  // SP-PLC-3 P3c.5: critical channel 入队 — sqlite 已 ready (line 276 之前),
+  // 直接 inline 注入. broadcast 在 ws-server.ts 内 enqueueCriticalMessage 触发.
+  enqueueWsMessage: (entry) => sqlite.enqueueWsMessage(entry),
+  // SP-PLC-3 P3c.5: ack 收到 → markDelivered + observe latency.
+  // onAckLatency 是 mutable ref (cache-metrics 后段 wire-up 后赋值);
+  // 早期 ack (cache-metrics 注册前) 仍 markDelivered, 仅 Histogram 不 observe.
+  markAckReceived: (msgId) =>
+    wsQueueMarkAck(
+      { markWsMessageDelivered: (id) => sqlite.markWsMessageDelivered(id) },
+      msgId,
+      { onAckLatency: onWsAckLatency ?? undefined },
+    ),
 });
 
 // M3 (Level 3): MQTT subscriber — 外部 HMI 写意图 → 建议缓冲区
@@ -3291,16 +3313,24 @@ import { launchPlcWorkerForReactor, shutdownPlcWorkers } from './engine/plc-work
 // onCachePublish 闭包与 start() 内 launchPlcWorkerForReactor / scheduler.on
 // 'snapshot' 路径都能在运行期透 cacheSyncHandle?.publish 走 Redis. handle 为
 // noop 时 (REDIS_URL 空 / 连接失败) 等价 Phase 2 行为 (单实例).
-import { initRedisClient } from './lib/redis-client';
+import { initRedisClient, isRedisConnected } from './lib/redis-client';
 import { startRedisCacheSync, type RedisCacheSyncHandle } from './engine/redis-cache-sync';
+// SP-PLC-3 P3c.5: ws_message_queue dispatcher (启动期接入).
+import { startWsMessageQueueDispatcher } from './engine/ws-message-queue';
 let cacheSyncHandle: RedisCacheSyncHandle | null = null;
 const cacheMetrics = registerCacheMetrics({
   registry: metricsRegistry,
   tagCache,
   reactorIds: () => reactorManager.listReactors().map((r) => r.id),
+  // SP-PLC-3 P3c.5: Redis 连接状态 + ws_message_queue 行数采样, 复用 30s tick.
+  isRedisConnected: () => isRedisConnected(),
+  countWsMessagesByStatus: () => sqlite.countWsMessagesByStatus(),
 });
 // 绑定上文 createWsServer 的 onSkip mutable ref (no-subscription 路径).
 onWsSkip = (reason) => cacheMetrics.skippedTotal.inc({ reason });
+// SP-PLC-3 P3c.5: 绑定 ack latency mutable ref → cache-metrics Histogram observe.
+// 此后 markAckReceived 路径回调 observe; 之前的 ack (启动早期) 仍正常 markDelivered 但不上报 Histogram.
+onWsAckLatency = (seconds) => cacheMetrics.wsAckLatencySeconds.observe(seconds);
 
 const {
   startReactorCollector,
@@ -3738,9 +3768,15 @@ async function start(): Promise<void> {
   // cacheSyncHandle 是 module-scope 让顶层 createReactorWiring 的
   // onCachePublish 闭包以及上面 worker / main-thread 路径的 onWrite 闭包都能
   // 在赋值后立即透传到 publish.
+  //
+  // P3c.5: 注入 onPublish 钩子 → biocore_redis_publish_total{channel} Counter.
   try {
     const redisClient = await initRedisClient();
-    cacheSyncHandle = await startRedisCacheSync({ redis: redisClient, tagCache });
+    cacheSyncHandle = await startRedisCacheSync({
+      redis: redisClient,
+      tagCache,
+      onPublish: (channel) => cacheMetrics.redisPublishTotal.inc({ channel }),
+    });
     console.log(`[${new Date().toISOString()}] [INFO] [redis-cache-sync] serverId=${cacheSyncHandle.serverId} mode=${redisClient ? 'redis' : 'standalone'}`);
   } catch (err) {
     console.error(`[${new Date().toISOString()}] [ERROR] [redis-cache-sync] 启动失败, 降级单实例:`, (err as Error).message);
@@ -3748,6 +3784,40 @@ async function start(): Promise<void> {
   }
   process.on('SIGTERM', () => { cacheSyncHandle?.stop(); });
   process.on('SIGINT', () => { cacheSyncHandle?.stop(); });
+
+  // ─── SP-PLC-3 P3c.5: ws_message_queue dispatcher 启动 ──────────────
+  // 默认启动 (WS_QUEUE_DISABLED=true 时 skip → critical 退回 best-effort
+  // Phase 2 行为 + ws-server.broadcast 中 enqueueWsMessage 仍调但无 dispatcher
+  // 取出 → 行为相当于消息累积在 'pending' 永远不发送. 因此 hot-rollback 必须
+  // 同时 ALSO 让 ws-server 不入队 — 通过取消 createWsServer.opts.enqueueWsMessage
+  // 注入做到. 当前实现简化: WS_QUEUE_DISABLED 只控 dispatcher 启动, 不影响入队;
+  // 真 hot-rollback 操作: env 设 WS_QUEUE_DISABLED=true + 重启 server,
+  // 已在 pending 的旧 row 等到 disabled=false 重启后才会被处理.
+  const WS_QUEUE_DISABLED = (process.env.WS_QUEUE_DISABLED ?? '').toLowerCase() === 'true';
+  if (!WS_QUEUE_DISABLED) {
+    try {
+      const dispatcherHandle = startWsMessageQueueDispatcher({
+        sqlite: {
+          enqueueWsMessage: (entry) => sqlite.enqueueWsMessage(entry),
+          claimPendingWsMessages: (limit) => sqlite.claimPendingWsMessages(limit),
+          markWsMessageDelivered: (id) => sqlite.markWsMessageDelivered(id),
+          incrementWsMessageRetry: (id, err) => sqlite.incrementWsMessageRetry(id, err),
+          markWsMessageFailed: (id, err) => sqlite.markWsMessageFailed(id, err),
+          rollbackInProgressWsMessages: () => sqlite.rollbackInProgressWsMessages(),
+        },
+        wss,
+        ackTimeoutMs: Number(process.env.WS_ACK_TIMEOUT_MS ?? 5000),
+        maxRetries: Number(process.env.WS_QUEUE_RETRY_MAX ?? 3),
+      });
+      console.log(`[${new Date().toISOString()}] [INFO] [ws-msg-queue] dispatcher started (tick=500ms ackTimeout=${process.env.WS_ACK_TIMEOUT_MS ?? 5000}ms maxRetries=${process.env.WS_QUEUE_RETRY_MAX ?? 3})`);
+      process.on('SIGTERM', () => dispatcherHandle.stop());
+      process.on('SIGINT', () => dispatcherHandle.stop());
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] [ERROR] [ws-msg-queue] 启动失败:`, (err as Error).message);
+    }
+  } else {
+    console.log(`[${new Date().toISOString()}] [INFO] [ws-msg-queue] WS_QUEUE_DISABLED=true, dispatcher 未启动 (critical 入队仍发生, 累积 pending)`);
+  }
 
   // ─── SP-PLC-3 P2 + P3b.2: PollingScheduler 启动 ─────────────────────
   // 仅生产模式启动 (MOCK_PLC=true 时 reactor-wiring 走 buildMockSnapshot,

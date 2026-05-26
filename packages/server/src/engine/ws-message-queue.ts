@@ -188,15 +188,30 @@ function dispatchOne(row: any, deps: WsMessageQueueDeps, maxRetries: number, now
  *
  * 注意: 调用方 (ws-server.ts message handler) 不需要做 sqlite 错误兜底,
  * 本函数只在 entry 存在时调 markWsMessageDelivered; sqlite 抛错冒泡到 caller.
+ *
+ * P3c.5: opts.onAckLatency 可选钩子, 成功 markDelivered 路径调一次, 入参为
+ * 秒数 (= (now - sentAt) / 1000). 给 cache-metrics
+ * biocore_ws_ack_latency_seconds Histogram observe 用. 钩子异常被吞.
+ * opts.now 可注入假时钟 (默认 Date.now), 用于测试.
  */
 export function markAckReceived(
   sqlite: Pick<WsQueueSqliteShape, 'markWsMessageDelivered'>,
   msgId: number,
+  opts?: { onAckLatency?: (seconds: number) => void; now?: () => number },
 ): boolean {
   const entry = pendingAcks.get(msgId);
   if (!entry) return false;
   sqlite.markWsMessageDelivered(entry.rowId);
   pendingAcks.delete(msgId);
+  // P3c.5: latency observe — 在 sqlite 写入后调, 钩子异常不回滚 markDelivered.
+  if (opts?.onAckLatency) {
+    try {
+      const nowMs = (opts.now ?? Date.now)();
+      opts.onAckLatency((nowMs - entry.sentAt) / 1000);
+    } catch (err) {
+      console.error(`[ws-msg-queue] onAckLatency hook threw msgId=${msgId}: ${(err as Error).message}`);
+    }
+  }
   return true;
 }
 

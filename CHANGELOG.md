@@ -105,3 +105,15 @@ All notable changes since v1.14.0.
 总: +700 LOC, +43 new vitest tests, server 367/367 pass, engine 59/59 pass.
 
 新 env vars (默认即旧行为, 不需配置): `INFLUX_FLUSH_MS=1000`, `BROADCAST_TICK_MS=200`, `WS_MAX_BUFFERED_AMOUNT=1048576`.
+
+### SP-PLC-3 Phase 3c — 横向扩展 + reliable queue + ack (2026-05-26)
+
+Redis-based 多 server 实例支持. 9-13h scope, 5 commit + ~37 tests. 详见 `docs/plans/SP-PLC-3-tag-cache-phase3c-plan.md`.
+
+- **Redis client + TagCache 跨实例 pub/sub** (`4952067`, P3c.1): channel `tagcache:write`, 自回环防护, REDIS_URL 空 = Phase 2 兼容. ioredis ^5.4.0 引入. 8 tests.
+- **subscription Redis hash + clientId 握手** (`902836b`, P3c.2): subStates WeakMap→Map<clientId>, Redis hash 镜像 `subscriptions:{server_id}:{client_id}` 跨 server 可查. 6 tests.
+- **ws_message_queue reliable queue** (`b206a87`, P3c.3): sqlite migration 041 + 复用 ai_suggestions dispatch_status state machine. critical channel (alarm/state_update/recipe_downloaded) 走 queue, pv_realtime 仍 best-effort. 10 tests.
+- **客户端 ack + msg_id** (`d062d2a`, P3c.4): server send 附 msg_id, client send back ack 触发 markDelivered, 5s 超时 retry. 9 tests.
+- **E2E + 4 metrics + 部署文档** (P3c.5, hash pending): `biocore_redis_connected` Gauge, `biocore_redis_publish_total{channel}` Counter, `biocore_ws_queue_size{status}` Gauge, `biocore_ws_ack_latency_seconds` Histogram. 5 E2E + 部署说明 §13 + dispatcher 启动 wire-up.
+
+总: +1 npm dep (ioredis ~3MB), +1 SQL migration (041), +6 env vars (REDIS_URL, SERVER_ID, WS_QUEUE_DISABLED, WS_ACK_DISABLED, WS_ACK_TIMEOUT_MS, WS_QUEUE_RETRY_MAX), +~40 tests. engine 138/138 pass, server vitest pass count +5 (455→460).

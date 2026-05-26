@@ -1,5 +1,7 @@
 // ============================================================
 // cache-metrics — TagCache + broadcaster 监控指标 (SP-PLC-3 P2.5)
+// SP-PLC-3 P3a.2 加 fanoutHistogram; P3b.2 加 plcWorkerState;
+// P3c.5 加 redisConnected / redisPublishTotal / wsQueueSize / wsAckLatencySeconds.
 // ============================================================
 //
 // 注册 4 个 Prometheus metrics (复用 SP-FX-28 MetricsRegistry):
@@ -52,6 +54,21 @@ export interface CacheMetricsDeps {
   reactorIds: () => string[];
   /** 仅测试用: 覆盖 size gauge 采样周期 (ms). 默认 30000. */
   sizeSampleMs?: number;
+  /**
+   * SP-PLC-3 P3c.5: 可选 Redis 连接状态采样函数. 注入时 30s 周期采集到
+   * biocore_redis_connected Gauge (1=connected, 0=disconnected). 未注入
+   * 则 Gauge 保持 0 (等价 "Redis 不可用 / 未启用").
+   * 实参通常是 `() => isRedisConnected()` (lib/redis-client export).
+   */
+  isRedisConnected?: () => boolean;
+  /**
+   * SP-PLC-3 P3c.5: 可选 ws_message_queue 各状态行数采样函数. 注入时 30s
+   * 周期采集到 biocore_ws_queue_size{status} Gauge. 未注入则 Gauge 留 0.
+   * 实参通常是 `() => sqlite.countWsMessagesByStatus()` (data-service export).
+   * 返回字典必须含全部状态 ('pending'/'dispatching'/'delivered'/'failed');
+   * 缺失状态被 set(0) 不报错.
+   */
+  countWsMessagesByStatus?: () => Record<string, number>;
 }
 
 /** registerCacheMetrics 返回值, export 让 caller (index.ts 的 cache.write 处) 用. */
@@ -85,6 +102,32 @@ export interface CacheMetricsHandle {
    * 留 0 即等价 "无 worker 状态可报", 跟 worker spawn 失败语义一致.
    */
   plcWorkerState: Gauge;
+  /**
+   * SP-PLC-3 P3c.5: Redis 连接状态 Gauge. 1=connected, 0=disconnected/未启用.
+   * 注入 deps.isRedisConnected 时由 30s tick 自动写; 未注入则保持 0.
+   */
+  redisConnected: Gauge;
+  /**
+   * SP-PLC-3 P3c.5: Redis publish 累计 Counter, label=channel.
+   * Caller (index.ts startup) 在 startRedisCacheSync 调用前后把 publish
+   * 钩子注入: deps.onPublish=(ch) => handle.redisPublishTotal.inc({channel: ch}).
+   * 单实例模式 (publish=noop) 永不 inc, Counter 显示 channel=tagcache:write 0.
+   */
+  redisPublishTotal: Counter;
+  /**
+   * SP-PLC-3 P3c.5: ws_message_queue 各状态 row 数 Gauge, label=status
+   * (pending/dispatching/delivered/failed). 30s tick 调
+   * deps.countWsMessagesByStatus() 整批 set; 未注入则永远 0.
+   */
+  wsQueueSize: Gauge;
+  /**
+   * SP-PLC-3 P3c.5: client ack 延迟 Histogram (秒).
+   * Caller (index.ts startWsMessageQueueDispatcher) 在 markAckReceived
+   * 成功路径调 handle.wsAckLatencySeconds.observe((now - sentAt)/1000) 注入.
+   * 无 label (与 fanoutHistogram 一致, 避免 cardinality 爆); buckets 复用
+   * services/metrics 固定 `[0.01, 0.05, 0.1, 0.5, 1, 5]` 秒.
+   */
+  wsAckLatencySeconds: Histogram;
   /** 停止采样 / 解订阅. 重复调用安全. */
   stop: () => void;
 }
@@ -128,6 +171,23 @@ export function registerCacheMetrics(deps: CacheMetricsDeps): CacheMetricsHandle
     'biocore_plc_worker_state',
     'PLC worker thread state per reactor (1=running, 0=stopped/failed/fallback)',
   );
+  // SP-PLC-3 P3c.5: Redis + ws_message_queue 4 metric (factory 幂等, 同名返同实例).
+  const redisConnected = deps.registry.gauge(
+    'biocore_redis_connected',
+    'Redis client connection state (1=connected, 0=disconnected or REDIS_URL empty)',
+  );
+  const redisPublishTotal = deps.registry.counter(
+    'biocore_redis_publish_total',
+    'Total Redis publish calls by channel (caller-incremented in redis-cache-sync)',
+  );
+  const wsQueueSize = deps.registry.gauge(
+    'biocore_ws_queue_size',
+    'Number of ws_message_queue rows per status (pending/dispatching/delivered/failed)',
+  );
+  const wsAckLatencySeconds = deps.registry.histogram(
+    'biocore_ws_ack_latency_seconds',
+    'Critical WS message ack latency in seconds (server send → client ack received)',
+  );
 
   // 接 TagCache fan-out (callback 仅在 sameValue=false 时触发, 即 deadband 通过).
   const subId = deps.tagCache.subscribe({
@@ -141,6 +201,7 @@ export function registerCacheMetrics(deps: CacheMetricsDeps): CacheMetricsHandle
   });
 
   // size gauge 周期采集. 异常被 try/catch 包: 任一 reactor 异常不影响其它.
+  // P3c.5: 同 tick 内一并采 redisConnected + wsQueueSize (复用 30s 周期, 不开新 timer).
   const sizeTick = setInterval(() => {
     let ids: string[];
     try {
@@ -162,6 +223,33 @@ export function registerCacheMetrics(deps: CacheMetricsDeps): CacheMetricsHandle
         );
       }
     }
+    // P3c.5: Redis 连接状态采样 — 注入则读, 否则保持上次值 (启动时 Gauge 默认 0).
+    if (deps.isRedisConnected) {
+      try {
+        redisConnected.set(deps.isRedisConnected() ? 1 : 0);
+      } catch (err) {
+        console.error(
+          `[${new Date().toISOString()}] [ERROR] [cache-metrics] isRedisConnected() threw:`,
+          (err as Error).message,
+        );
+      }
+    }
+    // P3c.5: ws_message_queue 各状态行数采样 — 注入则整批 set.
+    if (deps.countWsMessagesByStatus) {
+      try {
+        const counts = deps.countWsMessagesByStatus();
+        // 显式 set 4 个已知状态 (缺失 → 0), 防 "状态被清空但 Gauge 留旧值" 假象.
+        const allStatuses = ['pending', 'dispatching', 'delivered', 'failed'] as const;
+        for (const status of allStatuses) {
+          wsQueueSize.set(counts[status] ?? 0, { status });
+        }
+      } catch (err) {
+        console.error(
+          `[${new Date().toISOString()}] [ERROR] [cache-metrics] countWsMessagesByStatus() threw:`,
+          (err as Error).message,
+        );
+      }
+    }
   }, sizeSampleMs);
 
   let stopped = false;
@@ -172,5 +260,17 @@ export function registerCacheMetrics(deps: CacheMetricsDeps): CacheMetricsHandle
     deps.tagCache.unsubscribe(subId);
   };
 
-  return { writesTotal, sizeGauge, dirtyTotal, skippedTotal, fanoutHistogram, plcWorkerState, stop };
+  return {
+    writesTotal,
+    sizeGauge,
+    dirtyTotal,
+    skippedTotal,
+    fanoutHistogram,
+    plcWorkerState,
+    redisConnected,
+    redisPublishTotal,
+    wsQueueSize,
+    wsAckLatencySeconds,
+    stop,
+  };
 }

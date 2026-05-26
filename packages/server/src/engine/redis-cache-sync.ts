@@ -46,6 +46,12 @@ export interface RedisCacheSyncDeps {
   tagCache: TagCache;
   /** 可选注入 server_id (默认启动期生成 UUID). 用于自回环检测. */
   serverId?: string;
+  /**
+   * SP-PLC-3 P3c.5: 可选 publish 钩子. 每次本实例真发 publish 命令时调一次
+   * (无论 publish 是否成功). 给 cache-metrics 累计 biocore_redis_publish_total{channel}
+   * 用. noop handle (redis=null) 永远不调.
+   */
+  onPublish?: (channel: string) => void;
 }
 
 export interface RedisCacheSyncHandle {
@@ -114,7 +120,16 @@ export async function startRedisCacheSync(
     publish: (reactorId, snap) => {
       // 异步 publish; 失败吞错 (TagCache.write 已 onWrite 内 try/catch,
       // 此处 catch 是双保险 + 区分日志来源).
+      // P3c.5: onPublish 钩子在发出 publish 命令时同步调一次 (无论 promise
+      // 成功还是失败 — Counter 表 "尝试 publish 次数"); 钩子异常被吞防 caller crash.
       const payload = JSON.stringify({ source: serverId, reactorId, snap });
+      if (deps.onPublish) {
+        try {
+          deps.onPublish(REDIS_CACHE_SYNC_CHANNEL);
+        } catch (err) {
+          console.error('[redis-cache-sync] onPublish hook threw:', (err as Error).message);
+        }
+      }
       mainClient.publish(REDIS_CACHE_SYNC_CHANNEL, payload).catch((err: Error) => {
         console.error('[redis-cache-sync] publish error:', err.message);
       });
