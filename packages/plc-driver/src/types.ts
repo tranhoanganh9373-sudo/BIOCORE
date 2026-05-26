@@ -54,6 +54,10 @@ export interface PLCVariableMapping {
   poll_rate_ms: number;
   enabled: boolean;
   connection_id: string;
+  /** SP-PLC-3 P2.1 (migration 040): 绝对死区, 0 = 关闭 (回退全局 deadband). */
+  deadband_abs?: number;
+  /** SP-PLC-3 P2.1 (migration 040): 百分比死区 (单位 %), 0 = 关闭. */
+  deadband_pct?: number;
 }
 
 export interface ParsedAddress {

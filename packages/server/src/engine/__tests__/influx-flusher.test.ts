@@ -187,7 +187,14 @@ describe('SP-PLC-3 P3 — startInfluxFlusher', () => {
     expect(errSpy).toHaveBeenCalled();
     expect(errSpy.mock.calls[0][0]).toMatch(/reactor=R1 tick failed/);
 
-    // 下次 tick 仍跑
+    // SP-PLC-3 P2.2: 下次 tick 前更新 cache 值 (新 lastChanged), 否则 flusher
+    // 见 lastChanged 未变会 skip → 测不到 "下次 tick 仍跑" 的语义 (本 test
+    // 测的是 R1 抛错后 R2 不受影响 + 轮询不崩, 不是 dedup 行为).
+    // 注: R1 抛错路径让 lastFlushedAt 未更新, R1 见 lastChanged 不同 (因 R2 之前
+    // 成功更新过自己的, 这里 R1 之前也写过但抛错→未更新 lastFlushedAt) → R1 仍能再写.
+    // 但稳健起见显式更新两个 reactor 的值.
+    cache.write('R1', { timestamp: '2026-05-25T00:00:02.000Z', values: { TEMP_PV: 40 }, quality: { TEMP_PV: 'good' } });
+    cache.write('R2', { timestamp: '2026-05-25T00:00:02.000Z', values: { TEMP_PV: 41 }, quality: { TEMP_PV: 'good' } });
     vi.advanceTimersByTime(1000);
     expect(r1Called).toBe(2);
     expect(r2Called).toBe(2);
@@ -211,6 +218,9 @@ describe('SP-PLC-3 P3 — startInfluxFlusher', () => {
     expect(points).toHaveLength(0);
     vi.advanceTimersByTime(1);
     expect(points).toHaveLength(1);
+    // SP-PLC-3 P2.2: 第二次 tick 前更新 cache (新 lastChanged) 让 flusher 写新 Point,
+    // 否则 lastChanged 未变会 skip — 本 test 测的是 tick 频率而非 dedup 行为.
+    cache.write('R1', { timestamp: '2026-05-25T00:00:01.000Z', values: { TEMP_PV: 38 }, quality: { TEMP_PV: 'good' } });
     vi.advanceTimersByTime(500);
     expect(points).toHaveLength(2);
     stop();
@@ -253,5 +263,114 @@ describe('SP-PLC-3 P3 — startInfluxFlusher', () => {
     vi.advanceTimersByTime(3000);
     expect(reactorIdsFn).not.toHaveBeenCalled(); // null api 早 return
     expect(() => stop()).not.toThrow();
+  });
+});
+
+// ============================================================
+// SP-PLC-3 P2.2 (2026-05-26): lastChanged 判定 (deadband 抑制后 skip 写入)
+// ============================================================
+describe('influx-flusher - SP-PLC-3 P2.2 lastChanged 判断', () => {
+  let cache: TagCache;
+
+  beforeEach(() => {
+    cache = new TagCache();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // ── P2.2 Test 1: 同 lastChanged 重复 flush 时 skip 该 tag ──
+  it('同 lastChanged 重复 flush 时 skip (deadband 抑制 → cache.lastChanged 不更新 → flusher 不重复写)', () => {
+    const { api, points } = makeWriteApi();
+    // 首次写入 TEMP_PV=37
+    cache.write('R1', snap({ TEMP_PV: 37 }, undefined));
+
+    const stop = startInfluxFlusher({
+      tagCache: cache,
+      influxWriteApi: api,
+      reactorIds: () => ['R1'],
+      getBatchId: () => 'b1',
+      flushMs: 1000,
+    });
+
+    // Tick 1: 首次 flush, lastFlushedAt 空 → temperature 字段写入
+    vi.advanceTimersByTime(1000);
+    expect(points).toHaveLength(1);
+    expect(points[0].fields.find((f) => f[0] === 'temperature')).toBeDefined();
+
+    // 模拟 deadband 抑制: 再写同值 (cache 内同值不更新 lastChanged)
+    cache.write('R1', { timestamp: '2026-05-25T00:00:05.000Z', values: { TEMP_PV: 37 }, quality: { TEMP_PV: 'good' } });
+
+    // Tick 2: entry.lastChanged 未变 → temperature 字段 skip → fieldCount=0 → 不写 Point
+    vi.advanceTimersByTime(1000);
+    expect(points).toHaveLength(1); // 仍是 tick 1 那 1 个 Point, tick 2 全 skip
+    stop();
+  });
+
+  // ── P2.2 Test 2: lastChanged 变化时正常写 (deadband 未抑制 → cache 更新 → flusher 写入) ──
+  it('lastChanged 变化时正常写 (cache.lastChanged 更新 → flusher 写新 Point)', () => {
+    const { api, points } = makeWriteApi();
+    cache.write('R1', snap({ TEMP_PV: 37 }, undefined));
+
+    const stop = startInfluxFlusher({
+      tagCache: cache,
+      influxWriteApi: api,
+      reactorIds: () => ['R1'],
+      getBatchId: () => 'b1',
+      flushMs: 1000,
+    });
+
+    // Tick 1
+    vi.advanceTimersByTime(1000);
+    expect(points).toHaveLength(1);
+    expect(points[0].fields.find((f) => f[0] === 'temperature')![1]).toBe(37);
+
+    // 值真变化 → cache.lastChanged 更新到新 ts
+    cache.write('R1', { timestamp: '2026-05-25T00:00:05.000Z', values: { TEMP_PV: 42 }, quality: { TEMP_PV: 'good' } });
+
+    // Tick 2: lastChanged 已变 → 重新写入 + 新 value
+    vi.advanceTimersByTime(1000);
+    expect(points).toHaveLength(2);
+    expect(points[1].fields.find((f) => f[0] === 'temperature')![1]).toBe(42);
+    stop();
+  });
+
+  // ── P2.2 Test 3: quality='bad' 仍 skip (现有行为不变, lastChanged 判断在 quality 之后) ──
+  it("quality='bad' 仍 skip (P2.2 lastChanged 路径不破现有 bad 行为)", () => {
+    const { api, points } = makeWriteApi();
+    cache.write('R1', snap({ TEMP_PV: 37, PH_PV: 7.2 }, undefined));
+    cache.markStale('R1', ['TEMP_PV']); // TEMP_PV quality → bad, value 保留 last-known-good 37
+
+    const stop = startInfluxFlusher({
+      tagCache: cache,
+      influxWriteApi: api,
+      reactorIds: () => ['R1'],
+      getBatchId: () => 'b1',
+      flushMs: 1000,
+    });
+
+    // Tick 1: temperature skip (quality bad), pH 正常写入
+    vi.advanceTimersByTime(1000);
+    expect(points).toHaveLength(1);
+    const tick1Fields = points[0].fields.map((f) => f[0]);
+    expect(tick1Fields).not.toContain('temperature');
+    expect(tick1Fields).toContain('pH');
+
+    // Tick 2: temperature 仍 bad → 仍 skip; pH lastChanged 未变 → skip
+    // → fieldCount=0 → 不写 Point
+    vi.advanceTimersByTime(1000);
+    expect(points).toHaveLength(1);
+
+    // 重新 good 一个新值给 pH (lastChanged 变化) → tick 3 pH 重新写
+    cache.write('R1', { timestamp: '2026-05-25T00:00:05.000Z', values: { PH_PV: 7.5 }, quality: { PH_PV: 'good' } });
+    vi.advanceTimersByTime(1000);
+    expect(points).toHaveLength(2);
+    const tick3Fields = points[1].fields.map((f) => f[0]);
+    expect(tick3Fields).not.toContain('temperature'); // TEMP_PV 仍 bad
+    expect(tick3Fields).toContain('pH');              // PH_PV lastChanged 已变
+    stop();
   });
 });

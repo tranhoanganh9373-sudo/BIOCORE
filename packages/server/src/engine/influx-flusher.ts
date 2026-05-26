@@ -19,8 +19,19 @@
 //   - 旧 collector 60s 一次 (setInterval(tick, 60000)). 本 flusher 1000ms
 //     一次 → 60× 写入频率, 是 plan §1 Commit 3 明示的升级.
 //
+// SP-PLC-3 P2.2 (2026-05-26) per-tag lastChanged 判定:
+//   - flusher 维护 lastFlushedAt: Map<`reactorId:tag`, entry.lastChanged>
+//     在 flusher 闭包 scope (非 module scope, 多实例隔离 + stop 时随闭包 GC).
+//   - 每 tick 对每个 tag: 若 entry.lastChanged === 上次 flush 记录值
+//     → tag 自上次 flush 未触发 change (deadband 抑制了无变化) → skip 不写入.
+//   - 首次 flush: lastFlushedAt 空 → 全字段写入 (符合 P3 现有行为).
+//   - quality='bad' skip 不变 (现有 6 tests 覆盖, lastChanged 判断**在
+//     quality 判断之后**, 不影响 bad skip 行为).
+//   - 影响: deadband 抑制后 cache.lastChanged 不更新 → flusher 见同 lastChanged
+//     → 跳过 → InfluxDB 不写无意义点.
+//
 // 不做:
-//   - retention / downsample (Influx 服务端配置)
+//   - retention / downsample (Influx 服务端配置, P2.5 起加 downsample-flusher)
 //   - 批写 / pyfolio 风格压缩 (Phase 2)
 // ============================================================
 
@@ -67,6 +78,11 @@ const INFLUX_TAGS: readonly string[] = INFLUX_FIELDS.map((f) => f.tag);
 export function startInfluxFlusher(deps: FlusherDeps): () => void {
   const flushMs = deps.flushMs ?? readEnvInt('INFLUX_FLUSH_MS', DEFAULT_FLUSH_MS);
 
+  // SP-PLC-3 P2.2: per-tag 上次 flush 写入时记录的 entry.lastChanged.
+  // key = `${reactorId}:${tag}`, value = ISO timestamp (CacheEntry.lastChanged).
+  // 闭包 scope (非 module scope) → stop 后随闭包 GC, 多 flusher 实例隔离.
+  const lastFlushedAt: Map<string, string> = new Map();
+
   const tick = (): void => {
     if (!deps.influxWriteApi) return; // 开发模式 noop
 
@@ -91,20 +107,35 @@ export function startInfluxFlusher(deps: FlusherDeps): () => void {
           .tag('batch_id', deps.getBatchId(reactorId))
           .timestamp(new Date());
 
+        // SP-PLC-3 P2.2: 本 tick 真写入的 (key, lastChanged), 仅当 reactor 整体
+        // 至少有 1 字段写入时才一次性 commit 到 lastFlushedAt (与 fieldCount === 0
+        // 时 skip writePoint 的原行为一致, 避免 lastFlushedAt 记录无对应 Point 的 ts).
+        const pendingFlushed: Array<[string, string]> = [];
         let fieldCount = 0;
         for (const { field, tag, transform } of INFLUX_FIELDS) {
           const entry = entries[tag];
           if (!entry) continue;                  // cache miss → skip 字段
           if (entry.quality === 'bad') continue; // quality bad → skip 字段
+          // SP-PLC-3 P2.2: lastChanged 同上次 flush → 该 tag 未触发 change
+          // (deadband 抑制无变化), skip 不写 InfluxDB.
+          const key = `${reactorId}:${tag}`;
+          const lastFlush = lastFlushedAt.get(key);
+          if (lastFlush !== undefined && lastFlush === entry.lastChanged) continue;
           const value = transform ? transform(entry.value) : entry.value;
           point.floatField(field, value);
+          pendingFlushed.push([key, entry.lastChanged]);
           fieldCount++;
         }
 
-        // 全字段 bad / 全 miss → 不调 writePoint (空 Point 无意义)
+        // 全字段 bad / 全 miss / 全 lastChanged 未变 → 不调 writePoint (空 Point 无意义)
         if (fieldCount === 0) continue;
 
         deps.influxWriteApi.writePoint(point);
+        // commit lastFlushedAt (writePoint 不抛错才生效, 抛错被外层 catch 接管,
+        // 此处保持事务原子性: 要么整 reactor 全写入 + 全更新 lastFlushedAt, 要么全不更新).
+        for (const [key, ts] of pendingFlushed) {
+          lastFlushedAt.set(key, ts);
+        }
         anyPointWritten = true;
       } catch (err) {
         // 单 reactor 失败不影响其它 reactor 本 tick
@@ -132,6 +163,7 @@ export function startInfluxFlusher(deps: FlusherDeps): () => void {
     if (stopped) return;
     stopped = true;
     clearInterval(interval);
+    lastFlushedAt.clear(); // SP-PLC-3 P2.2: 释放 Map (闭包 scope, 实际 GC 在闭包释放时)
   };
 }
 

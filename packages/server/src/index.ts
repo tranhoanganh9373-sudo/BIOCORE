@@ -3258,7 +3258,7 @@ initAuditQueue(sqlite);
 // 内 await (需要先 await migrationsReady, 否则查 plc_reactor_bindings 撞
 // 空 schema). pollingSchedulers Map 传引用给 createReactorWiring, 启动期
 // 填充后, reactor-wiring 闭包按 reactorId 查表选 mock / 真实路径.
-import { TagCache } from './engine/tag-cache';
+import { TagCache, type DeadbandResolver } from './engine/tag-cache';
 // 仅引 type, 避免顶层 import 触发 @biocore/plc-driver 主 entry 加载
 // (含 node-snap7 native binding, dev/test 环境无 native build 会 crash).
 // 真实实例由 start() 内 dynamic import 创建, 仅 MOCK_PLC=false 走此路径.
@@ -3642,6 +3642,24 @@ async function start(): Promise<void> {
       const plcDriver = await import('@biocore/plc-driver');
       const { PLCConnectionManager, PollingScheduler } = plcDriver;
       const reactors = reactorManager.listReactors();
+      // ─── SP-PLC-3 P2.2: per-tag deadband resolver ───────────────
+      // 从 plc_variable_mappings.deadband_abs/_pct (P2.1 migration 040) 读
+      // per-tag 配置, abs/pct 均 0 = 关闭 per-tag → tag-cache 回退全局
+      // deadband (默认 0 = Phase 1 全推行为). 仅注入到真实 PLC 路径
+      // (PollingScheduler.on('snapshot')); MOCK 路径 (reactor-wiring.ts:167)
+      // 因 plc_variable_mappings 表常无 mock 数据, varManager.getVariables
+      // 返空 → resolver 返 undefined 等价不破, 不需注入.
+      const deadbandResolver: DeadbandResolver = (reactorId, tag) => {
+        const bindings = sqlite.getPlcReactorBindingsByReactor(reactorId);
+        if (bindings.length === 0) return undefined;
+        const plcId = bindings[0].plc_id;
+        const mapping = varManager.getVariables(plcId).find((v: PLCVariableMapping) => v.tag_name === tag);
+        if (!mapping) return undefined;
+        return {
+          abs: mapping.deadband_abs ?? 0,
+          pct: mapping.deadband_pct ?? 0,
+        };
+      };
       const startPromises = reactors.map(async (reactor) => {
         try {
           // plan §B getReactorPLCConnection helper 不存在 — 走现有
@@ -3658,7 +3676,10 @@ async function start(): Promise<void> {
           mgr.setVariables(varManager.getVariables(plcId));
           await mgr.connect();
           const scheduler = new PollingScheduler(mgr);
-          scheduler.on('snapshot', (snap: any) => tagCache.write(reactor.id, snap));
+          // SP-PLC-3 P2.2: 把 deadbandResolver 注入 write opts, 让 P2.1 ship 的
+          // per-tag deadband 真正作用于 cache → broadcaster (dirty-only) +
+          // flusher (lastChanged-only) 双路径.
+          scheduler.on('snapshot', (snap: any) => tagCache.write(reactor.id, snap, { deadbandResolver }));
           scheduler.on('error', (err: any) => {
             console.error(`[${new Date().toISOString()}] [ERROR] [scheduler:${reactor.id}]`, err);
             tagCache.markStale(reactor.id);
