@@ -87,6 +87,18 @@ export interface WriteOptions {
   deadband?: number;
   /** SP-PLC-3 P2.1: per-tag deadband 解析. 优先级高于 opts.deadband. */
   deadbandResolver?: DeadbandResolver;
+  /**
+   * SP-PLC-3 P3c.1: write 完成后 (含 fanOut) 调用一次的同步 hook.
+   * caller 用作 Redis publish 钩子, 把 (reactorId, snapshot, changes)
+   * 异步 publish 到跨实例 channel. snapshot 是原始 input, changes 是
+   * 本次 write 实际产生的变化 (deadband 抑制后).
+   *
+   * 行为约定:
+   *   - 同步调用, write 返 changes 前最后一步触发.
+   *   - 抛错被 try/catch 隔离, 不影响 write 返值, 不影响 subscribe fanOut.
+   *   - 不传 → 不调用 (兼容 Phase 1-3b 旧 caller).
+   */
+  onWrite?: (reactorId: string, snapshot: SnapshotInput, changes: CacheChange[]) => void;
 }
 
 /**
@@ -218,6 +230,18 @@ export class TagCache {
     if (changes.length > 0) {
       this.fanOut(changes);
     }
+
+    // SP-PLC-3 P3c.1: 同步 onWrite hook (Redis publish 入口).
+    // 抛错被隔离: 一个失败的 publish 不影响 write 返值, 也不影响下游
+    // subscribe 回调 (fanOut 已先于 hook 完成).
+    if (opts?.onWrite) {
+      try {
+        opts.onWrite(reactorId, snapshot, changes);
+      } catch (err) {
+        console.error('[tag-cache] onWrite hook error:', err);
+      }
+    }
+
     return changes;
   }
 

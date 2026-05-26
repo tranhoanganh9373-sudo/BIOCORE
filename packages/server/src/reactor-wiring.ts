@@ -98,6 +98,11 @@ export interface ReactorWiringDeps {
    * 路径 writes_total 不累计 (仅真实 PLC 路径计数), 兼容老 wiring.
    */
   onCacheWrite?: (reactorId: string) => void;
+  /**
+   * SP-PLC-3 P3c.1: 可选 Redis publish 钩子, 注入到 tagCache.write opts.onWrite.
+   * mock 路径 cache 变化 → publish 到跨实例 channel. 不传 → 不 publish (单实例).
+   */
+  onCachePublish?: (reactorId: string, snap: SnapshotInput) => void;
 }
 
 /**
@@ -134,7 +139,7 @@ export interface ReactorWiringHandles {
 }
 
 export function createReactorWiring(deps: ReactorWiringDeps): ReactorWiringHandles {
-  const { sqlite, influxWriteApi, broadcast, autoCollectDoeResponses, tagCache, pollingSchedulers, onCacheWrite } = deps;
+  const { sqlite, influxWriteApi, broadcast, autoCollectDoeResponses, tagCache, pollingSchedulers, onCacheWrite, onCachePublish } = deps;
 
   // 启动单个反应器的时序采集 (60秒一次写入 InfluxDB)
   function startReactorCollector(reactorId: string): void {
@@ -172,7 +177,12 @@ export function createReactorWiring(deps: ReactorWiringDeps): ReactorWiringHandl
         if (MOCK_PLC || !pollingSchedulers?.get(reactorId)) {
           // SP-PLC-3 P2.5: 显式 inc writes_total (回调注入, 不传 → noop, 兼容老 wiring).
           if (onCacheWrite) onCacheWrite(reactorId);
-          tagCache.write(reactorId, buildMockSnapshot(TAGS, reactorId));
+          // SP-PLC-3 P3c.1: opts.onWrite 仅在 onCachePublish 注入时附加, 维持
+          // 老路径无 opts 行为 (避免 hook 抛错路径在 dev/test 触发).
+          const writeOpts = onCachePublish
+            ? { onWrite: (rid: string, snap: SnapshotInput) => onCachePublish(rid, snap) }
+            : undefined;
+          tagCache.write(reactorId, buildMockSnapshot(TAGS, reactorId), writeOpts);
         }
 
         // SP-PLC-3 P3 (plan §1 Commit 3): 已拆出

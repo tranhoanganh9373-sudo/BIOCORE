@@ -3286,6 +3286,14 @@ import { registerCacheMetrics } from './engine/cache-metrics';
 // SP-PLC-3 P3b.2: per-reactor worker launcher + shutdown helpers (抽到独立
 // 模块便于 worker-lifecycle.test.ts 单测 backoff/降级/SIGTERM 路径).
 import { launchPlcWorkerForReactor, shutdownPlcWorkers } from './engine/plc-worker-launcher';
+// SP-PLC-3 P3c.1: Redis client + TagCache 跨实例同步桥. handle 用 module-scope
+// mutable ref, start() 内 await 后赋值, 让 module 顶层 createReactorWiring 的
+// onCachePublish 闭包与 start() 内 launchPlcWorkerForReactor / scheduler.on
+// 'snapshot' 路径都能在运行期透 cacheSyncHandle?.publish 走 Redis. handle 为
+// noop 时 (REDIS_URL 空 / 连接失败) 等价 Phase 2 行为 (单实例).
+import { initRedisClient } from './lib/redis-client';
+import { startRedisCacheSync, type RedisCacheSyncHandle } from './engine/redis-cache-sync';
+let cacheSyncHandle: RedisCacheSyncHandle | null = null;
 const cacheMetrics = registerCacheMetrics({
   registry: metricsRegistry,
   tagCache,
@@ -3307,6 +3315,9 @@ const {
   pollingSchedulers,
   // SP-PLC-3 P2.5: mock 路径 write_total 累计.
   onCacheWrite: () => cacheMetrics.writesTotal.inc(),
+  // SP-PLC-3 P3c.1: mock 路径 cache 变化 → Redis publish (cacheSyncHandle
+  // 在 start() 内才赋值, 早期 mock tick 因 handle=null → noop, 等价单实例).
+  onCachePublish: (rid, snap) => cacheSyncHandle?.publish(rid, snap),
 });
 
 // ─── SP-PLC-3 P3: broadcaster + flusher (plan §1 Commit 3) ─────────
@@ -3721,6 +3732,23 @@ async function start(): Promise<void> {
   process.on('SIGTERM', () => scadaDispatcherHandle.stop());
   process.on('SIGINT', () => scadaDispatcherHandle.stop());
 
+  // ─── SP-PLC-3 P3c.1: Redis client + TagCache 跨实例同步桥 ──────────
+  // REDIS_URL 未设 → initRedisClient 返 null → startRedisCacheSync 返 noop
+  // handle (publish/stop 无副作用), 等价 Phase 2 行为. 失败不阻塞 start().
+  // cacheSyncHandle 是 module-scope 让顶层 createReactorWiring 的
+  // onCachePublish 闭包以及上面 worker / main-thread 路径的 onWrite 闭包都能
+  // 在赋值后立即透传到 publish.
+  try {
+    const redisClient = await initRedisClient();
+    cacheSyncHandle = await startRedisCacheSync({ redis: redisClient, tagCache });
+    console.log(`[${new Date().toISOString()}] [INFO] [redis-cache-sync] serverId=${cacheSyncHandle.serverId} mode=${redisClient ? 'redis' : 'standalone'}`);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] [ERROR] [redis-cache-sync] 启动失败, 降级单实例:`, (err as Error).message);
+    cacheSyncHandle = null;
+  }
+  process.on('SIGTERM', () => { cacheSyncHandle?.stop(); });
+  process.on('SIGINT', () => { cacheSyncHandle?.stop(); });
+
   // ─── SP-PLC-3 P2 + P3b.2: PollingScheduler 启动 ─────────────────────
   // 仅生产模式启动 (MOCK_PLC=true 时 reactor-wiring 走 buildMockSnapshot,
   // 跟 plan §6 Q-v 候选 A 一致). 动态 import 隔离 native binding 加载:
@@ -3777,7 +3805,13 @@ async function start(): Promise<void> {
                 startSchedulerInWorker,
                 onSnapshot: (rid, snap) => {
                   cacheMetrics.writesTotal.inc();
-                  tagCache.write(rid, snap, { deadbandResolver });
+                  // SP-PLC-3 P3c.1: opts.onWrite → cacheSyncHandle.publish (handle=null
+                  // 时是 noop 闭包, 等价单实例; handle 在 start() 早期已赋值, 但保留
+                  // optional-chain 防御早期 race).
+                  tagCache.write(rid, snap, {
+                    deadbandResolver,
+                    onWrite: (r, s) => cacheSyncHandle?.publish(r, s),
+                  });
                 },
                 onWorkerState: (rid, state) => {
                   cacheMetrics.plcWorkerState.set(state === 'running' ? 1 : 0, { reactor: rid });
@@ -3818,7 +3852,12 @@ async function start(): Promise<void> {
             scheduler.on('snapshot', (snap: any) => {
               // SP-PLC-3 P2.5: 显式 inc writesTotal (含 deadband 抑制的 write — 与 metric 命名一致).
               cacheMetrics.writesTotal.inc();
-              tagCache.write(reactor.id, snap, { deadbandResolver });
+              // SP-PLC-3 P3c.1: opts.onWrite → cacheSyncHandle.publish (跨实例同步,
+              // handle=null 单实例 noop).
+              tagCache.write(reactor.id, snap, {
+                deadbandResolver,
+                onWrite: (r, s) => cacheSyncHandle?.publish(r, s),
+              });
             });
             scheduler.on('error', (err: any) => {
               console.error(`[${new Date().toISOString()}] [ERROR] [scheduler:${reactor.id}]`, err);
